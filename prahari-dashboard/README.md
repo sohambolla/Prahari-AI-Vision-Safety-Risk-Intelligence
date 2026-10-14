@@ -1,5 +1,16 @@
 # PRAHARI dashboard
 
+## Pull the shared feature branch
+
+From an existing clone of the repository, run these commands from the repository root to get the equipment-detection changes and their Git LFS assets:
+
+```bash
+git lfs install
+git fetch origin
+git switch --track origin/feature/equipment-detection
+git lfs pull
+```
+
 ## Run the dashboard with live detection
 
 Install the dashboard's vision-server requirements in the Python environment you will use (`pip install -r requirements-vision.txt` from this directory), install the dashboard packages (`npm install`), then start the dashboard with `npm run dev`.
