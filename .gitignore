@@ -177,5 +177,10 @@ debug_output/
 # Secrets
 secrets.toml
 
+# Downloaded YOLOE open-vocabulary runtime assets
+/weights/yoloe-11s-seg.pt
+/weights/clip/
+/mobileclip_blt.ts
+
 # Node dependencies
 node_modules/

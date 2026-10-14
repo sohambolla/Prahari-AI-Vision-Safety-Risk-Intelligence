@@ -1,67 +1,32 @@
-import { useState, useEffect } from 'react'
-import { AlertTriangle, ChevronRight, MapPin } from 'lucide-react'
+import { AlertTriangle, ChevronRight, MapPin, RefreshCw } from 'lucide-react'
 import './LiveAlerts.css'
 
-const ALERTS_DATA = [
-  {
-    id: 1, severity: 'critical', time: '14:27:18',
-    title: 'Worker near unprotected edge',
-    detail: '(0.8 m for 6 sec)',
-    location: 'Level 6 – East Wing'
-  },
-  {
-    id: 2, severity: 'warning', time: '14:26:31',
-    title: 'Scaffold overcrowded',
-    detail: '5 workers (limit 3)',
-    location: 'Level 6 – East Wing'
-  },
-  {
-    id: 3, severity: 'critical', time: '14:25:10',
-    title: 'Worker without helmet',
-    detail: '',
-    location: 'Level 6 – East Wing'
-  },
-  {
-    id: 4, severity: 'warning', time: '14:23:04',
-    title: 'Person under suspended load zone',
-    detail: '',
-    location: 'Level 4 – Crane 01'
-  },
-  {
-    id: 5, severity: 'info', time: '14:20:45',
-    title: 'PPE compliance check passed',
-    detail: 'All workers compliant',
-    location: 'Level 3 – West Wing'
-  },
-]
-
-export default function LiveAlerts() {
-  const [alerts, setAlerts] = useState(ALERTS_DATA)
-  const [flashId, setFlashId] = useState(null)
-
-  useEffect(() => {
-    // Simulate new alerts arriving
-    const interval = setInterval(() => {
-      setFlashId(1)
-      setTimeout(() => setFlashId(null), 1500)
-    }, 8000)
-    return () => clearInterval(interval)
-  }, [])
-
+export default function LiveAlerts({ alerts = [], onRefresh }) {
   return (
     <div className="card alerts-card">
       <div className="card-header">
         <span className="card-title">Live Safety Alerts</span>
-        <button className="view-all-btn">
-          View All <ChevronRight size={12} />
-        </button>
+        <div className="alerts-header-actions">
+          <button className="refresh-alerts-btn" onClick={onRefresh} title="Clear alert history and load the current live alert">
+            <RefreshCw size={11} /> Refresh
+          </button>
+          <button className="view-all-btn">
+            View All <ChevronRight size={12} />
+          </button>
+        </div>
       </div>
 
-      <div className="alerts-list">
+      <div className="alerts-list" aria-live="polite">
+        {alerts.length === 0 && (
+          <div className="alerts-empty">
+            <AlertTriangle size={16} />
+            <span>No live safety alerts. Alerts appear here when the camera raises one.</span>
+          </div>
+        )}
         {alerts.map((alert, i) => (
           <div
             key={alert.id}
-            className={`alert-item alert-${alert.severity} ${flashId === alert.id ? 'flash' : ''}`}
+            className={`alert-item alert-${alert.severity}`}
             style={{ animationDelay: `${i * 0.08}s` }}
           >
             <div className="alert-severity-bar" />

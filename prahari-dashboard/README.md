@@ -1,16 +1,13 @@
-# React + Vite
+# PRAHARI dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+## Run the dashboard with live detection
 
-Currently, two official plugins are available:
+Install the dashboard's vision-server requirements in the Python environment you will use (`pip install -r requirements-vision.txt` from this directory), install the dashboard packages (`npm install`), then start the dashboard with `npm run dev`.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+The Vite development server starts `prahari_live_server.py` automatically when port 8000 is free. It uses `python` by default. Set `PRAHARI_PYTHON` to the Python executable for the environment containing the vision requirements if needed. The first startup downloads the YOLOE-11 segmentation checkpoint to the repository's `weights` directory. Its text encoder is fetched when you first apply object prompts, so allow network access on first use. Set `PRAHARI_OVS_MODEL` to use a different local YOLOE segmentation checkpoint and `PRAHARI_OVS_IMGSZ` to adjust inference resolution (default 960).
 
-## React Compiler
+The browser retries the WebSocket connection while the model loads. Enter comma-separated equipment names (for example, `forklift, generator, gear, bearing`) and select **Apply targets**. The server adds `person` automatically and displays masks, track IDs, and short movement trails for prompted objects. Adjust **CONF** to trade missed detections for more false alarms. On CAM 07, the demo restricted area is placed across the forklift's route. Other feeds retain their existing configured zones.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+YOLOE is a zero-shot starting point, not a guarantee for every machine part or camera angle. The screen reports if the optional segmentation model could not load and the existing YOLO detector remains available as a fallback. For a real "unauthorized asset" policy, configure the exact approved asset list and the site's entry zones; category prompts alone cannot decide whether a particular machine is authorized.
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+If the HUD reports that the server is offline, check the Vite terminal for the Python startup error. To manage the vision server yourself, set `PRAHARI_AUTOSTART_VISION=0`; the dashboard will keep reconnecting to port 8000. To use a different host or secure WebSocket endpoint, set `VITE_VISION_WS_URL` to its base URL, such as `wss://vision.example.com`.

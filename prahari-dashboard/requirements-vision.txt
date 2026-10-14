@@ -1,0 +1,4 @@
+fastapi
+opencv-python-headless
+ultralytics>=8.4.0
+uvicorn[standard]

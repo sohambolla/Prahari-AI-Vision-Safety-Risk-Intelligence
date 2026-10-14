@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import './index.css'
 import Header from './components/Header'
 import LiveVisionPanel from './components/LiveVisionPanel'
@@ -13,6 +13,8 @@ import MVPTimeline from './components/MVPTimeline'
 
 function App() {
   const [currentTime, setCurrentTime] = useState(new Date())
+  const [safetyAlerts, setSafetyAlerts] = useState([])
+  const [alertRefreshSignal, setAlertRefreshSignal] = useState(0)
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)
@@ -25,6 +27,20 @@ function App() {
   const formatDate = (d) =>
     d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
 
+  const handleSafetyAlert = useCallback((alert) => {
+    const createdAt = new Date()
+    setSafetyAlerts(previous => [{
+      ...alert,
+      id: `${alert.cameraId}-${alert.type}-${createdAt.getTime()}`,
+      time: createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+    }, ...previous].slice(0, 20))
+  }, [])
+
+  const refreshSafetyAlerts = useCallback(() => {
+    setSafetyAlerts([])
+    setAlertRefreshSignal(signal => signal + 1)
+  }, [])
+
   return (
     <>
       <Header time={formatTime(currentTime)} date={formatDate(currentTime)} />
@@ -32,10 +48,14 @@ function App() {
       {/* Row 1: Live Vision + Alerts + Replay */}
       <div className="dashboard-grid">
         <div className="col-5" style={{ animationDelay: '0.1s' }}>
-          <LiveVisionPanel time={formatTime(currentTime)} />
+          <LiveVisionPanel
+            time={formatTime(currentTime)}
+            onSafetyAlert={handleSafetyAlert}
+            alertRefreshSignal={alertRefreshSignal}
+          />
         </div>
         <div className="col-3" style={{ animationDelay: '0.2s' }}>
-          <LiveAlerts />
+          <LiveAlerts alerts={safetyAlerts} onRefresh={refreshSafetyAlerts} />
         </div>
         <div className="col-4" style={{ animationDelay: '0.3s' }}>
           <EventReplay />
