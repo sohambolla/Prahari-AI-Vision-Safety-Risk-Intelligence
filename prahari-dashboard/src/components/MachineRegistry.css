@@ -1,0 +1,45 @@
+.machine-registry-card { padding: 16px; }
+.machine-registry-card .card-title { display: inline-flex; align-items: center; gap: 7px; }
+.machine-dry-run { display: inline-flex; align-items: center; gap: 4px; color: #fbbf24; font: 700 0.62rem var(--font-mono); }
+.machine-registry-note { margin: 0 0 12px; color: var(--text-muted); font-size: 0.7rem; line-height: 1.45; }
+.machine-token-field { display: grid; grid-template-columns: 15px 86px minmax(120px, 1fr); align-items: center; gap: 7px; margin-bottom: 10px; color: var(--text-secondary); font-size: 0.68rem; }
+.machine-token-field input,
+.machine-edit-form input,
+.machine-calibration-form input,
+.interlock-check-form input:not([type="checkbox"]),
+.interlock-check-form select { min-width: 0; padding: 7px 8px; color: var(--text-primary); background: rgba(8, 13, 25, 0.78); border: 1px solid var(--border-default); border-radius: 5px; font-size: 0.68rem; }
+.machine-edit-form { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 7px; }
+.machine-edit-form button,
+.machine-row button,
+.machine-calibration-form button,
+.interlock-check-form > button { padding: 7px 10px; color: #fff; background: #2563eb; border: 0; border-radius: 5px; font-size: 0.67rem; font-weight: 700; cursor: pointer; }
+.machine-edit-form button:hover,
+.machine-row button:hover,
+.machine-calibration-form button:hover,
+.interlock-check-form > button:hover { background: #3b82f6; }
+.machine-form-message { margin-top: 8px; color: #34d399; font-size: 0.68rem; }
+.machine-form-message.is-error { color: #fca5a5; }
+.machine-list { display: grid; gap: 8px; margin-top: 12px; }
+.machine-empty { padding: 12px; color: var(--text-muted); border: 1px dashed var(--border-default); border-radius: 6px; font-size: 0.7rem; }
+.machine-row { padding: 10px; border: 1px solid var(--border-default); border-radius: 7px; background: rgba(255,255,255,0.02); }
+.machine-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.machine-row-heading > div { display: grid; gap: 3px; }
+.machine-row-heading strong { color: var(--text-primary); font-size: 0.75rem; }
+.machine-row-heading span,.machine-authorized,.machine-home { color: var(--text-muted); font-size: 0.65rem; }
+.machine-row-heading button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 7px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-default); }
+.machine-row-heading button.maintenance-active { color: #fbbf24; border-color: #fbbf24; }
+.machine-authorized,.machine-home { margin-top: 6px; }
+.machine-calibration-form { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; color: var(--text-secondary); font-size: 0.64rem; }
+.machine-calibration-form input { width: 74px; }
+.machine-calibration-form button { padding: 6px 8px; }
+.interlock-check-form { display: grid; grid-template-columns: minmax(140px, auto) minmax(130px, 1fr) minmax(130px, 1fr) auto auto; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-default); }
+.interlock-check-form > strong { color: var(--text-primary); font-size: 0.7rem; }
+.interlock-ppe-options { display: flex; gap: 7px; color: var(--text-secondary); font-size: 0.62rem; text-transform: capitalize; }
+.interlock-ppe-options label { display: inline-flex; align-items: center; gap: 3px; }
+.interlock-ppe-options input { accent-color: #22c55e; }
+.interlock-check-form > button:disabled { opacity: .45; cursor: not-allowed; }
+.interlock-result { grid-column: 1 / -1; padding: 8px; border-radius: 5px; font-size: 0.67rem; }
+.interlock-result.is-allowed { color: #6ee7b7; background: rgba(16,185,129,.08); }
+.interlock-result.is-blocked { color: #fca5a5; background: rgba(239,68,68,.08); }
+.interlock-result ul { margin: 5px 0 0 16px; padding: 0; }
+@media (max-width: 720px) { .machine-edit-form { grid-template-columns: 1fr; } .interlock-check-form { grid-template-columns: 1fr; } }

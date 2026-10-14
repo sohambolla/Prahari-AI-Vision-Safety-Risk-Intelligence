@@ -42,6 +42,9 @@ from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized, TracedModel
 
 from yolov7face import YOLOv7Face, YOLOv7Configs, FaceAnonymizer
+from prahari_safety.perception import legacy_boxes_to_detections
+from prahari_safety.runtime import SafetyRuntime
+from prahari_safety.tracker import ByteTrackAdapter
 
 ASCII_LOGO = '''\
 --------------------------------------------------------------------------
@@ -107,6 +110,7 @@ def process():
         mask_faces =config['mask_faces']
         api_key = config['api_key']
         chat_id = config['chat_id']
+        safety_runtime = SafetyRuntime(config.get('safety_config', 'configs/risk_config.json'))
          
         if opt.cpu and not half:
             
@@ -143,6 +147,7 @@ def process():
             model_object_map = None
             
         source = []
+        camera_ids = []
         policy = []
         duration = []
         timers = []
@@ -150,8 +155,9 @@ def process():
         last_activity_time = []
         
         
-        for camera in camera_list:
+        for camera_index, camera in enumerate(camera_list):
             source.append(camera['url'])
+            camera_ids.append(str(camera.get('id') or f'camera-{camera_index + 1:02d}'))
             policy.append(camera['policy_file'])
             duration.append(camera['duration'])
             if 'alert_url' in camera:
@@ -177,6 +183,9 @@ def process():
             policy_data.append(json.load(f))
             # print(policy_data)
             f.close()
+        tracker_config = safety_runtime.config.get('tracker', {})
+        safety_trackers = [ByteTrackAdapter(**tracker_config) for _ in camera_list]
+        safety_class_ids = [{} for _ in camera_list]
         if opt.cpu and not half:
             dataset = LoadStreams(source, use_open_vino=True)
         else:
@@ -253,6 +262,7 @@ def process():
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
                 
                 flag = False
+                box_list = []
                 
                 if opt.no_activity_alert is not None:
                     if t_begin - last_activity_time[i] > opt.no_activity_alert:
@@ -297,6 +307,38 @@ def process():
                             label = f'{names[int(cls)]} {conf:.2f}'
                             plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=1)
                         '''
+
+                # Feed the same tracked detections to PRAHARI's temporal risk rules.
+                # Existing camera policy checks below remain enabled and unchanged.
+                if safety_runtime is not None:
+                    normalized_detections = safety_trackers[i].update(
+                        legacy_boxes_to_detections(box_list, safety_class_ids[i])
+                    )
+                    safety_zones = []
+                    if data.get('type') in ('exclusion_zones', 'ppe_detection_exclusion_zones') and not data.get('inclusion_zone', False):
+                        zone_config = data.get('zones') or {}
+                        for zone_index, zone in enumerate(zone_config.get('objects', [])):
+                            polygon = []
+                            for point in zone.get('path', []):
+                                if isinstance(point, (list, tuple)) and len(point) >= 3 and str(point[0]).casefold() != 'z':
+                                    polygon.append([float(point[1]) / 600.0 * 100.0, float(point[2]) / 400.0 * 100.0])
+                            if len(polygon) >= 3:
+                                safety_zones.append({
+                                    'zone_id': f'exclusion-{zone_index + 1}',
+                                    'type': 'restricted',
+                                    'polygon': polygon,
+                                })
+                    archive_frame = im0
+                    if mask_faces and face_detector is not None:
+                        try:
+                            archive_frame = face_detector.predict_img(im0.copy())
+                        except Exception as exc:
+                            print(f"[WARN] PRAHARI privacy blur skipped for {camera_ids[i]}: {exc}")
+                    for safety_event in safety_runtime.process_frame(
+                        camera_ids[i], normalized_detections, im0, safety_zones,
+                        archive_frame=archive_frame,
+                    ):
+                        print(f"[PRAHARI {safety_event['severity'].upper()}] {camera_ids[i]}: {safety_event['title']}")
                         
                     violation_type = data['type']
                     

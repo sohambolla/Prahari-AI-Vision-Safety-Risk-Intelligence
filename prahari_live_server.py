@@ -14,16 +14,22 @@ import math
 import numpy as np
 import os
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO, YOLOWorld
 try:
     from ultralytics import YOLOE
 except ImportError:
     YOLOE = None
 import uvicorn
+from prahari_safety.runtime import SafetyRuntime
 
 app = FastAPI(title="PRAHARI AI Vision Engine")
+safety_runtime = SafetyRuntime()
+SAFETY_ALERT_CLIENTS = set()
+SEEN_INCIDENT_IDS = set()
+app.mount("/incidents", StaticFiles(directory=str(safety_runtime.store.root)), name="incidents")
 
 app.add_middleware(
     CORSMiddleware,
@@ -237,6 +243,11 @@ OPEN_VOCABULARY_SYNONYMS = {
     "washer": ("metal washer",),
 }
 MAX_EXPANDED_OVS_PROMPTS = 18
+SAFETY_MONITOR_PROMPTS = (
+    "fire", "smoke", "suspended load", "forklift", "safety helmet", "safety vest",
+    "safety gloves", "door", "conveyor belt", "handrail", "MEWP", "weapon",
+    "ammo box", "unattended bag", "machine",
+)
 SCREEN_PROMPT_TERMS = {
     "screen", "monitor", "display", "computer monitor", "computer screen", "computer display",
 }
@@ -316,10 +327,17 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
         confidence = 0.15
     if not math.isfinite(confidence):
         confidence = 0.15
-    use_open_vocabulary = bool(prompts and open_vocabulary_model is not None)
+    # Keep the safety rule engine supplied with its core visual classes while
+    # still accepting arbitrary operator prompts in the same segmentation pass.
+    use_open_vocabulary = bool((prompts or SAFETY_MONITOR_PROMPTS) and open_vocabulary_model is not None)
     if use_open_vocabulary:
         expanded_prompts = expand_open_vocabulary_prompts(prompts)
         classes = ["person", *expanded_prompts]
+        seen_classes = {label.casefold() for label in classes}
+        for label in SAFETY_MONITOR_PROMPTS:
+            if label.casefold() not in seen_classes:
+                classes.append(label)
+                seen_classes.add(label.casefold())
         if classes == failed_open_vocabulary_prompts:
             use_open_vocabulary = False
         else:
@@ -336,6 +354,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
                     for tracker in getattr(predictor, "trackers", []):
                         tracker.reset()
                     active_open_vocabulary_camera = camera_id
+                    safety_runtime.risk_engine.reset(camera_id)
                 results = open_vocabulary_model.track(
                     frame,
                     persist=True,
@@ -458,7 +477,8 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
             xyxy = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0].cpu().numpy())
             cls_id = int(box.cls[0].cpu().numpy())
-            track_id = int(box.id[0].cpu().numpy()) if box.id is not None else (i + 1)
+            tracking_confirmed = box.id is not None
+            track_id = int(box.id[0].cpu().numpy()) if tracking_confirmed else (i + 1)
 
             # Replace a phone label only when the vehicle model finds a strongly
             # overlapping car/truck/bus/bike of its own with a matching box.
@@ -492,6 +512,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
                 "h": h_pct,
                 "color": color,
                 "is_person": is_person,
+                "tracking_confirmed": tracking_confirmed,
             }
             if use_open_vocabulary:
                 det["open_vocabulary"] = not is_person
@@ -593,7 +614,182 @@ def read_root():
         "model": MODEL_LABEL,
         "open_vocabulary_segmentation": open_vocabulary_model is not None,
         "open_vocabulary_error": open_vocabulary_error or None,
+        "safety_runtime": "online",
+        "site_outputs": "dry-run",
     }
+
+
+async def broadcast_safety_message(message):
+    if message.get("type") == "incident" and isinstance(message.get("incident"), dict):
+        event_id = message["incident"].get("event_id") or message["incident"].get("id")
+        if event_id:
+            if event_id in SEEN_INCIDENT_IDS:
+                return
+            SEEN_INCIDENT_IDS.add(event_id)
+    disconnected = []
+    for client in tuple(SAFETY_ALERT_CLIENTS):
+        try:
+            await client.send_json(message)
+        except Exception:
+            disconnected.append(client)
+    for client in disconnected:
+        SAFETY_ALERT_CLIENTS.discard(client)
+
+
+@app.get("/api/safety/events")
+def get_safety_events(limit: int = 50, camera_id: str | None = None):
+    return {"events": safety_runtime.list_events(limit, camera_id)}
+
+
+@app.post("/api/safety/events/{event_id}/actions/{action}")
+async def update_safety_event(event_id: str, action: str):
+    action = {"acknowledge": "ack", "false-alarm": "false_alarm"}.get(action, action)
+    try:
+        event = safety_runtime.store.update_status(event_id, action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if event is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    event["snapshot_url"] = safety_runtime._media_url(event.get("snapshot_path"))
+    event["clip_url"] = safety_runtime._media_url(event.get("clip_path"))
+    if action == "escalate":
+        event["actions"] = safety_runtime.action_router.dispatch(event)
+    await broadcast_safety_message({"type": "incident_update", "incident": event})
+    return event
+
+
+@app.get("/api/machines")
+def get_machines():
+    return {"machines": safety_runtime.machines.list_machines(), "interlock_mode": "dry-run"}
+
+
+def require_machine_admin(authorization: str | None):
+    token_name = safety_runtime.config.get("admin_token_env", "PRAHARI_ADMIN_TOKEN")
+    expected = os.environ.get(token_name, "")
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail=f"Set {token_name} to enable machine registry writes")
+    if not supplied or not __import__("hmac").compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Valid admin bearer token required")
+
+
+@app.post("/api/machines/{machine_id}")
+def save_machine(machine_id: str, payload: dict = Body(...), authorization: str | None = Header(default=None)):
+    require_machine_admin(authorization)
+    try:
+        machine = safety_runtime.machines.upsert(
+            machine_id,
+            payload.get("camera_id"),
+            payload.get("detection_labels", []),
+            payload.get("authorized_person_ids", []),
+            payload.get("qr_value"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return machine
+
+
+@app.post("/api/machines/{machine_id}/calibrate")
+def calibrate_machine(machine_id: str, payload: dict = Body(...), authorization: str | None = Header(default=None)):
+    require_machine_admin(authorization)
+    try:
+        return safety_runtime.machines.calibrate(
+            machine_id, payload.get("camera_id"), payload.get("x_percent"), payload.get("y_percent")
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Machine is not registered") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/machines/{machine_id}/maintenance")
+def set_machine_maintenance(machine_id: str, payload: dict = Body(...), authorization: str | None = Header(default=None)):
+    require_machine_admin(authorization)
+    try:
+        return safety_runtime.machines.set_maintenance(machine_id, payload.get("enabled", False))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Machine is not registered") from exc
+
+
+@app.post("/api/machines/{machine_id}/interlock")
+def evaluate_machine_interlock(machine_id: str, payload: dict = Body(...)):
+    result = safety_runtime.interlock.evaluate_start(
+        machine_id, payload.get("person_id"), payload.get("ppe", {})
+    )
+    return result
+
+
+@app.post("/api/identity/presence")
+def register_identity_presence(payload: dict = Body(...), authorization: str | None = Header(default=None)):
+    require_machine_admin(authorization)
+    try:
+        safety_runtime.machines.register_identity_presence(
+            payload.get("camera_id"), payload.get("track_id"), payload.get("person_id"),
+            payload.get("source", "rfid"), payload.get("ttl_seconds", 30),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"registered": True, "expires_in_seconds": min(300, max(1, float(payload.get("ttl_seconds", 30))))}
+
+
+@app.websocket("/ws/safety-alerts")
+async def websocket_safety_alerts(websocket: WebSocket):
+    await websocket.accept()
+    SAFETY_ALERT_CLIENTS.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        SAFETY_ALERT_CLIENTS.discard(websocket)
+
+
+async def _auto_escalate_loop():
+    while True:
+        try:
+            for event in safety_runtime.auto_escalate_due():
+                event["snapshot_url"] = safety_runtime._media_url(event.get("snapshot_path"))
+                event["clip_url"] = safety_runtime._media_url(event.get("clip_path"))
+                await broadcast_safety_message({"type": "incident_update", "incident": event})
+        except Exception as exc:
+            print(f"[WARN] Incident auto-escalation loop: {exc}")
+        await asyncio.sleep(1.0)
+
+
+async def _external_incident_poll_loop():
+    """Forward incidents written by securade.py or another local process."""
+    try:
+        SEEN_INCIDENT_IDS.update(event.get("event_id") for event in safety_runtime.list_events(limit=200)
+                                 if event.get("event_id"))
+    except Exception as exc:
+        print(f"[WARN] Initial incident history scan failed: {exc}")
+    while True:
+        try:
+            events = safety_runtime.list_events(limit=200)
+            for event in reversed(events):
+                event_id = event.get("event_id")
+                if event_id and event_id not in SEEN_INCIDENT_IDS:
+                    await broadcast_safety_message({"type": "incident", "incident": event})
+        except Exception as exc:
+            print(f"[WARN] External incident poll failed: {exc}")
+        await asyncio.sleep(0.5)
+
+
+@app.on_event("startup")
+async def start_auto_escalation():
+    app.state.escalation_task = asyncio.create_task(_auto_escalate_loop())
+    app.state.incident_poll_task = asyncio.create_task(_external_incident_poll_loop())
+
+
+@app.on_event("shutdown")
+async def stop_auto_escalation():
+    task = getattr(app.state, "escalation_task", None)
+    if task:
+        task.cancel()
+    poll_task = getattr(app.state, "incident_poll_task", None)
+    if poll_task:
+        poll_task.cancel()
 
 @app.websocket("/ws/vision/{camera_id}")
 async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
@@ -613,6 +809,7 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                 if "image" in data and data["image"]:
                     target_prompts = normalize_open_vocabulary_prompts(data.get("prompts"))
                     confidence = data.get("confidence", 0.15)
+                    zones = data.get("zones") if isinstance(data.get("zones"), list) else None
                     b64_str = data["image"]
                     if "," in b64_str:
                         b64_str = b64_str.split(",")[1]
@@ -624,6 +821,9 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                         detections, inference_ms, ovs_active = process_frame(
                             frame, track_first_seen, target_prompts, confidence, camera_id
                         )
+                        safety_alerts = safety_runtime.process_frame(camera_id, detections, frame, zones)
+                        for alert in safety_alerts:
+                            await broadcast_safety_message({"type": "incident", "incident": alert})
                         payload = {
                             "camera_id": camera_id,
                             "vision_api": 2,
@@ -636,6 +836,7 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                             "confidence_threshold": confidence,
                             "total_detections": len(detections),
                             "detections": detections,
+                            "safety_alerts": safety_alerts,
                         }
                         await websocket.send_text(json.dumps(payload))
                         continue
@@ -653,6 +854,9 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                     detections, inference_ms, ovs_active = process_frame(
                         frame, track_first_seen, camera_id=camera_id
                     )
+                    safety_alerts = safety_runtime.process_frame(camera_id, detections, frame)
+                    for alert in safety_alerts:
+                        await broadcast_safety_message({"type": "incident", "incident": alert})
                     payload = {
                         "camera_id": camera_id,
                         "vision_api": 2,
@@ -664,6 +868,7 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                         "open_vocabulary_error": open_vocabulary_error or None,
                         "total_detections": len(detections),
                         "detections": detections,
+                        "safety_alerts": safety_alerts,
                     }
                     await websocket.send_text(json.dumps(payload))
                 elif isinstance(source, str):

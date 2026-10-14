@@ -10,11 +10,13 @@ import RiskHeatmap from './components/RiskHeatmap'
 import ResourceMonitoring from './components/ResourceMonitoring'
 import SystemArchitecture from './components/SystemArchitecture'
 import MVPTimeline from './components/MVPTimeline'
+import MachineRegistry from './components/MachineRegistry'
 
 function App() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [safetyAlerts, setSafetyAlerts] = useState([])
-  const [alertRefreshSignal, setAlertRefreshSignal] = useState(0)
+  const apiBase = (import.meta.env.VITE_VISION_API_URL ||
+    `${window.location.protocol}//${window.location.hostname || 'localhost'}:8000`).replace(/\/$/, '')
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)
@@ -27,19 +29,87 @@ function App() {
   const formatDate = (d) =>
     d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
 
-  const handleSafetyAlert = useCallback((alert) => {
-    const createdAt = new Date()
-    setSafetyAlerts(previous => [{
-      ...alert,
-      id: `${alert.cameraId}-${alert.type}-${createdAt.getTime()}`,
-      time: createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
-    }, ...previous].slice(0, 20))
+  const handleSafetyAlert = useCallback((event) => {
+    const timestamp = Number(event.timestamp)
+    const eventTime = Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp * 1000) : new Date()
+    const eventId = event.event_id || event.id || `${event.camera_id || event.cameraId}-${event.event_type || event.type}-${eventTime.getTime()}`
+    const cameraId = event.camera_id || event.cameraId || ''
+    const location = event.location || [cameraId, event.zone_id].filter(Boolean).join(' · ') || 'Site location unavailable'
+    const normalized = {
+      ...event,
+      id: eventId,
+      event_id: event.event_id || eventId,
+      cameraId,
+      type: event.event_type || event.type || 'safety-event',
+      severity: String(event.severity || 'warning').toLowerCase(),
+      title: event.title || 'Safety incident',
+      detail: event.detail || '',
+      location,
+      time: eventTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+    }
+    setSafetyAlerts(previous => [normalized, ...previous.filter(item => item.id !== eventId)].slice(0, 200))
   }, [])
 
-  const refreshSafetyAlerts = useCallback(() => {
-    setSafetyAlerts([])
-    setAlertRefreshSignal(signal => signal + 1)
-  }, [])
+  useEffect(() => {
+    let disposed = false
+    let retryTimer
+    let socket
+    let retryDelay = 1000
+
+    fetch(`${apiBase}/api/safety/events?limit=20`)
+      .then(response => response.ok ? response.json() : Promise.reject(new Error('Incident history unavailable')))
+      .then(payload => { if (!disposed) (payload.events || []).slice().reverse().forEach(handleSafetyAlert) })
+      .catch(() => {})
+
+    const connect = () => {
+      if (disposed) return
+      const wsBase = apiBase.replace(/^http/, 'ws')
+      try {
+        socket = new WebSocket(`${wsBase}/ws/safety-alerts`)
+        socket.onopen = () => { retryDelay = 1000 }
+        socket.onmessage = message => {
+          try {
+            const payload = JSON.parse(message.data)
+            if (payload.incident) handleSafetyAlert(payload.incident)
+          } catch {}
+        }
+        socket.onclose = () => {
+          if (disposed) return
+          retryTimer = window.setTimeout(connect, retryDelay)
+          retryDelay = Math.min(10000, retryDelay * 2)
+        }
+        socket.onerror = () => socket.close()
+      } catch {
+        retryTimer = window.setTimeout(connect, retryDelay)
+        retryDelay = Math.min(10000, retryDelay * 2)
+      }
+    }
+    connect()
+
+    return () => {
+      disposed = true
+      window.clearTimeout(retryTimer)
+      socket?.close()
+    }
+  }, [apiBase, handleSafetyAlert])
+
+  const refreshSafetyAlerts = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase}/api/safety/events?limit=200`)
+      if (!response.ok) return
+      const payload = await response.json()
+      setSafetyAlerts([])
+      ;(payload.events || []).slice().reverse().forEach(handleSafetyAlert)
+    } catch {}
+  }, [apiBase, handleSafetyAlert])
+
+  const handleAlertAction = useCallback(async (alert, action) => {
+    if (!alert.event_id) return
+    try {
+      const response = await fetch(`${apiBase}/api/safety/events/${encodeURIComponent(alert.event_id)}/actions/${action}`, { method: 'POST' })
+      if (response.ok) handleSafetyAlert(await response.json())
+    } catch {}
+  }, [apiBase, handleSafetyAlert])
 
   return (
     <>
@@ -50,12 +120,10 @@ function App() {
         <div className="col-5" style={{ animationDelay: '0.1s' }}>
           <LiveVisionPanel
             time={formatTime(currentTime)}
-            onSafetyAlert={handleSafetyAlert}
-            alertRefreshSignal={alertRefreshSignal}
           />
         </div>
         <div className="col-3" style={{ animationDelay: '0.2s' }}>
-          <LiveAlerts alerts={safetyAlerts} onRefresh={refreshSafetyAlerts} />
+          <LiveAlerts alerts={safetyAlerts} onRefresh={refreshSafetyAlerts} onAction={handleAlertAction} />
         </div>
         <div className="col-4" style={{ animationDelay: '0.3s' }}>
           <EventReplay />
@@ -85,6 +153,12 @@ function App() {
         </div>
         <div className="col-6" style={{ animationDelay: '0.6s' }}>
           <MVPTimeline />
+        </div>
+      </div>
+
+      <div className="dashboard-grid" style={{ paddingTop: 0 }}>
+        <div className="col-12" style={{ animationDelay: '0.65s' }}>
+          <MachineRegistry />
         </div>
       </div>
     </>

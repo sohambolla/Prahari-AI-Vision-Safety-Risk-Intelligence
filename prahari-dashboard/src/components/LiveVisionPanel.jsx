@@ -92,19 +92,7 @@ const getDetectionColor = (detection) => {
   return getEquipmentColor(detection.class)
 }
 
-const pointInPolygon = (point, polygon) => {
-  let inside = false
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const [xi, yi] = polygon[i]
-    const [xj, yj] = polygon[j]
-    const crossesY = (yi > point.y) !== (yj > point.y)
-    const crossingX = ((xj - xi) * (point.y - yi)) / (yj - yi) + xi
-    if (crossesY && point.x < crossingX) inside = !inside
-  }
-  return inside
-}
-
-export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSignal = 0 }) {
+export default function LiveVisionPanel({ time }) {
   const [selectedCam, setSelectedCam] = useState(CAM_FEEDS[6])
   const [isPlaying, setIsPlaying] = useState(true)
   const [showOverlays, setShowOverlays] = useState(true)
@@ -123,6 +111,7 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
   const [openVocabularyActive, setOpenVocabularyActive] = useState(null)
   const [openVocabularyError, setOpenVocabularyError] = useState('')
   const [currentDetections, setCurrentDetections] = useState([])
+  const [latestServerAlert, setLatestServerAlert] = useState(null)
   const [webcamActive, setWebcamActive] = useState(false)
   const [webcamFaceBox, setWebcamFaceBox] = useState({ x: 38, y: 22, w: 24, h: 56 })
 
@@ -133,8 +122,8 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
   const mediaStreamRef = useRef(null)
   const containerRef = useRef(null)
   const animFrameRef = useRef(null)
-  const reportedSafetyAlertRef = useRef({ key: '', clearTimer: null })
-  const lastAlertRefreshSignalRef = useRef(alertRefreshSignal)
+  const serverAlertTimerRef = useRef(null)
+  const activeHazardZone = selectedCam.hazardZone || trackingData[selectedCam.id]?.hazard_zone || null
 
   // Switch feeds & handle video / webcam
   useEffect(() => {
@@ -220,6 +209,12 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
           try {
             const data = JSON.parse(event.data)
             if (data.camera_id && data.camera_id !== selectedCam.id) return
+            if (Array.isArray(data.safety_alerts) && data.safety_alerts.length) {
+              const alert = data.safety_alerts[data.safety_alerts.length - 1]
+              setLatestServerAlert(alert)
+              window.clearTimeout(serverAlertTimerRef.current)
+              serverAlertTimerRef.current = window.setTimeout(() => setLatestServerAlert(null), 8000)
+            }
             if (typeof data.open_vocabulary_active !== 'boolean') {
               setOpenVocabularyActive(false)
               setOpenVocabularyError('Vision server is outdated. Restart the dashboard and vision server.')
@@ -291,11 +286,14 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
     setFps(null)
     setInferenceMs(null)
     setOpenVocabularyActive(null)
+    setLatestServerAlert(null)
+    window.clearTimeout(serverAlertTimerRef.current)
     connect()
 
     return () => {
       disposed = true
       window.clearTimeout(retryTimer)
+      window.clearTimeout(serverAlertTimerRef.current)
       const ws = wsRef.current
       wsRef.current = null
       if (ws) ws.close()
@@ -330,6 +328,7 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
             image: dataUrl,
             prompts: targetPrompts,
             confidence: confidenceThreshold,
+            zones: activeHazardZone ? [{ zone_id: 'restricted', type: 'restricted', polygon: activeHazardZone }] : [],
           }))
         } catch (e) {}
       }
@@ -374,8 +373,6 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
     trajectoryMemoryRef.current.clear()
   }
 
-  // Only show a geofence where this camera has a configured polygon.
-  const activeHazardZone = selectedCam.hazardZone || trackingData[selectedCam.id]?.hazard_zone || null
   const hazardPointsStr = activeHazardZone?.map(p => `${p[0]},${p[1]}`).join(' ')
 
   // Filter detections based on user selection
@@ -387,82 +384,9 @@ export default function LiveVisionPanel({ time, onSafetyAlert, alertRefreshSigna
     return true  // 'all' shows everything: persons + objects
   })
 
-  // Alert logic uses all detections so a display filter cannot hide a real alert.
-  const criticalRiskDetection = currentDetections.find(d => isPersonDetection(d) && d.risk_level === 'critical')
-  const watchedPromptNames = new Set(targetPrompts.map(prompt => prompt.toLocaleLowerCase()))
-  const watchlistIntruder = activeHazardZone && currentDetections.find(detection => {
-    if (isPersonDetection(detection)) return false
-    if (!detection.open_vocabulary && !watchedPromptNames.has((detection.class || '').toLocaleLowerCase())) return false
-    const footX = detection.foot_x ?? (detection.x + detection.w / 2)
-    const footY = detection.foot_y ?? (detection.y + detection.h)
-    return Number.isFinite(footX) && Number.isFinite(footY) &&
-      pointInPolygon({ x: footX, y: footY }, activeHazardZone)
-  })
-  const personIntruder = activeHazardZone && currentDetections.find(detection => {
-    if (!isPersonDetection(detection)) return false
-    const footX = detection.foot_x ?? (detection.x + detection.w / 2)
-    const footY = detection.foot_y ?? (detection.y + detection.h)
-    return Number.isFinite(footX) && Number.isFinite(footY) &&
-      pointInPolygon({ x: footX, y: footY }, activeHazardZone)
-  })
-  const alertCameraEnabled = isAlertActive && selectedCam.id !== 'cam-webcam'
-  const activeSafetyAlert = !alertCameraEnabled ? null : watchlistIntruder ? {
-    type: 'restricted-object',
-    severity: 'critical',
-    title: 'Monitored object entered restricted area',
-    detail: `${watchlistIntruder.class} · ${watchlistIntruder.track_id}`,
-    location: selectedCam.location,
-  } : personIntruder ? {
-    type: 'restricted-person',
-    severity: 'critical',
-    title: 'Person entered restricted area',
-    detail: personIntruder.track_id,
-    location: selectedCam.location,
-  } : criticalRiskDetection ? {
-    type: 'ppe-compliance',
-    severity: 'critical',
-    title: 'PPE compliance alert',
-    detail: `${criticalRiskDetection.track_id} · helmet and high-visibility vest not detected`,
-    location: selectedCam.location,
-  } : null
-  const activeSafetyAlertKey = activeSafetyAlert
-    ? `${selectedCam.id}:${activeSafetyAlert.type}:${activeSafetyAlert.title}`
-    : ''
-
-  useEffect(() => {
-    const reported = reportedSafetyAlertRef.current
-    const refreshed = lastAlertRefreshSignalRef.current !== alertRefreshSignal
-    lastAlertRefreshSignalRef.current = alertRefreshSignal
-    if (refreshed) {
-      reported.key = ''
-      if (reported.clearTimer) {
-        window.clearTimeout(reported.clearTimer)
-        reported.clearTimer = null
-      }
-    }
-
-    if (!activeSafetyAlertKey) {
-      if (reported.key && !reported.clearTimer) {
-        reported.clearTimer = window.setTimeout(() => {
-          reported.key = ''
-          reported.clearTimer = null
-        }, 1200)
-      }
-      return
-    }
-
-    if (reported.clearTimer) {
-      window.clearTimeout(reported.clearTimer)
-      reported.clearTimer = null
-    }
-    if (reported.key === activeSafetyAlertKey) return
-
-    reported.key = activeSafetyAlertKey
-    onSafetyAlert?.({
-      ...activeSafetyAlert,
-      cameraId: selectedCam.id,
-    })
-  }, [activeSafetyAlertKey, alertRefreshSignal, onSafetyAlert, activeSafetyAlert?.detail, activeSafetyAlert?.location, activeSafetyAlert?.severity, activeSafetyAlert?.title, activeSafetyAlert?.type, selectedCam.id])
+  const activeSafetyAlert = isAlertActive && latestServerAlert?.camera_id === selectedCam.id
+    ? latestServerAlert
+    : null
 
   return (
     <div className="card live-vision-card" ref={containerRef}>

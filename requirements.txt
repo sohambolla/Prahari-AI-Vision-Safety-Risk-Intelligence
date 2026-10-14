@@ -114,6 +114,8 @@ openvino-telemetry; platform_machine == 'x86_64'
 nncf; platform_machine == 'x86_64'
 pytapo
 python-telegram-bot
+ultralytics>=8.4.0
+supervision>=0.25.0,<0.31
 schedule
 dash
 dash_bootstrap_components

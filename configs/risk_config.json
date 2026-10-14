@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "max_track_gap_seconds": 1.5,
+  "track_state_ttl_seconds": 60,
+  "zones": {
+    "test-video": [
+      {
+        "zone_id": "restricted-test-zone",
+        "type": "restricted",
+        "polygon": [[20, 37], [60, 37], [60, 74], [20, 74]]
+      }
+    ]
+  },
+  "perception": {
+    "confidence": 0.1,
+    "image_size": 960
+  },
+  "tracker": {
+    "track_activation_threshold": 0.1,
+    "lost_track_buffer": 30,
+    "minimum_matching_threshold": 0.8
+  },
+  "rules": {
+    "person_down": {
+      "enabled": true,
+      "min_width_height_ratio": 1.5,
+      "possible_fall_seconds": 2.0,
+      "critical_still_seconds": 5.0,
+      "movement_tolerance_px": 12,
+      "confirm_frames": 1,
+      "cooldown_seconds": 30
+    },
+    "fire_smoke": {
+      "enabled": true,
+      "labels": ["fire", "smoke"],
+      "min_confidence": 0.3,
+      "consecutive_frames": 10,
+      "cooldown_seconds": 60
+    },
+    "falling_object": {
+      "enabled": true,
+      "labels": ["suspended load", "falling object", "load"],
+      "history_frames": 5,
+      "min_downward_px_per_second": 240,
+      "start_y_max_px": 150,
+      "near_person_px": 200,
+      "cooldown_seconds": 30
+    },
+    "ppe": {
+      "enabled": true,
+      "confirm_frames": 4,
+      "cooldown_seconds": 30
+    },
+    "vehicle_proximity": {
+      "enabled": true,
+      "distance_px": 120,
+      "critical_distance_px": 50,
+      "confirm_frames": 3,
+      "cooldown_seconds": 15
+    },
+    "exit_blocked": {
+      "enabled": true,
+      "min_iou": 0.02,
+      "confirm_frames": 3,
+      "cooldown_seconds": 30
+    },
+    "restricted_zone": {
+      "enabled": true,
+      "intrusion_confirm_frames": 4,
+      "suspicious_labels": ["weapon", "ammo box", "unattended bag", "bag"],
+      "suspicious_dwell_seconds": 10,
+      "owner_distance_px": 100,
+      "cooldown_seconds": 30
+    },
+    "machine_shift": {
+      "enabled": true,
+      "max_shift_px": 50,
+      "cooldown_seconds": 60
+    },
+    "machine_touch": {
+      "enabled": true,
+      "minimum_overlap_iou": 0.05,
+      "confirm_frames": 4,
+      "max_track_gap_seconds": 1.5,
+      "cooldown_seconds": 30
+    }
+  },
+  "site": {
+    "enabled": false,
+    "dry_run": true,
+    "zone_routes": {}
+  },
+  "admin": {
+    "websocket_enabled": true,
+    "telegram_enabled": false,
+    "auto_call_enabled": false,
+    "auto_escalate_seconds": 60
+  },
+  "incident_store": {
+    "root": "output/incidents",
+    "db_path": "output/incidents.sqlite3",
+    "clip_seconds": 15,
+    "buffer_fps": 4
+  },
+  "machines_file": "configs/machines.json",
+  "admin_token_env": "PRAHARI_ADMIN_TOKEN"
+}

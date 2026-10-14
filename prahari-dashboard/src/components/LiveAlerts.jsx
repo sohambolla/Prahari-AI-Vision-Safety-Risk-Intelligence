@@ -1,17 +1,26 @@
 import { AlertTriangle, ChevronRight, MapPin, RefreshCw } from 'lucide-react'
+import { useState } from 'react'
 import './LiveAlerts.css'
 
-export default function LiveAlerts({ alerts = [], onRefresh }) {
+const API_BASE = (import.meta.env.VITE_VISION_API_URL ||
+  `${window.location.protocol}//${window.location.hostname || 'localhost'}:8000`).replace(/\/$/, '')
+
+export default function LiveAlerts({ alerts = [], onRefresh, onAction }) {
+  const [showAll, setShowAll] = useState(false)
+  const visibleAlerts = showAll ? alerts : alerts.slice(0, 8)
   return (
     <div className="card alerts-card">
       <div className="card-header">
         <span className="card-title">Live Safety Alerts</span>
         <div className="alerts-header-actions">
-          <button className="refresh-alerts-btn" onClick={onRefresh} title="Clear alert history and load the current live alert">
+          <button className="refresh-alerts-btn" onClick={onRefresh} title="Reload recent alerts from the safety server">
             <RefreshCw size={11} /> Refresh
           </button>
-          <button className="view-all-btn">
-            View All <ChevronRight size={12} />
+          <button className="view-all-btn" onClick={() => {
+            if (!showAll) onRefresh?.()
+            setShowAll(!showAll)
+          }}>
+            {showAll ? 'Show Less' : 'View All'} <ChevronRight size={12} />
           </button>
         </div>
       </div>
@@ -23,7 +32,7 @@ export default function LiveAlerts({ alerts = [], onRefresh }) {
             <span>No live safety alerts. Alerts appear here when the camera raises one.</span>
           </div>
         )}
-        {alerts.map((alert, i) => (
+        {visibleAlerts.map((alert, i) => (
           <div
             key={alert.id}
             className={`alert-item alert-${alert.severity}`}
@@ -43,6 +52,20 @@ export default function LiveAlerts({ alerts = [], onRefresh }) {
                 <MapPin size={10} />
                 {alert.location}
               </div>
+              {(alert.clip_url || alert.snapshot_url) && (
+                <div className="alert-media-links">
+                  {alert.clip_url && <a href={alert.clip_url.startsWith('http') ? alert.clip_url : `${API_BASE}${alert.clip_url}`} target="_blank" rel="noreferrer">Replay clip</a>}
+                  {alert.snapshot_url && <a href={alert.snapshot_url.startsWith('http') ? alert.snapshot_url : `${API_BASE}${alert.snapshot_url}`} target="_blank" rel="noreferrer">Snapshot</a>}
+                </div>
+              )}
+              {alert.event_id && (
+                <div className="alert-actions">
+                  {alert.status === 'new' && <button onClick={() => onAction?.(alert, 'acknowledge')}>Acknowledge</button>}
+                  {alert.status !== 'false_alarm' && alert.status !== 'escalated' && <button onClick={() => onAction?.(alert, 'escalate')}>Escalate</button>}
+                  {alert.status !== 'false_alarm' && <button onClick={() => onAction?.(alert, 'false-alarm')}>False alarm</button>}
+                  {alert.status && alert.status !== 'new' && <span className="alert-status">{alert.status.replace('_', ' ')}</span>}
+                </div>
+              )}
             </div>
           </div>
         ))}

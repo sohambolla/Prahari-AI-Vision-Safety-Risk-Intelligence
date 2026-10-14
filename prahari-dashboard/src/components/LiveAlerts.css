@@ -151,3 +151,38 @@
 .alert-location svg {
   color: var(--accent-cyan);
 }
+
+.alert-actions,
+.alert-media-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.alert-actions button,
+.alert-media-links a {
+  padding: 3px 6px;
+  color: var(--text-secondary);
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.alert-actions button:hover,
+.alert-media-links a:hover {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+
+.alert-status {
+  padding: 3px 6px;
+  color: var(--accent-cyan);
+  font-size: 0.62rem;
+  text-transform: capitalize;
+}
