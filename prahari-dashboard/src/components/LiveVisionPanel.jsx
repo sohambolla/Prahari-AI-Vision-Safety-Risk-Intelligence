@@ -47,6 +47,12 @@ const CAM_FEEDS = [
 const isPersonDetection = (detection) =>
   detection.is_person || /^person$/i.test(detection.class || '')
 
+const isCriticalRiskDetection = (detection) =>
+  detection.risk_level === 'critical' || (
+    isPersonDetection(detection) &&
+    [detection.ppe?.helmet?.detected, detection.ppe?.vest?.detected].includes(false)
+  )
+
 const EQUIPMENT_COLORS = {
   cup: '#ff9f1c',
   bottle: '#14b8a6',
@@ -214,6 +220,10 @@ export default function LiveVisionPanel({ time }) {
               setLatestServerAlert(alert)
               window.clearTimeout(serverAlertTimerRef.current)
               serverAlertTimerRef.current = window.setTimeout(() => setLatestServerAlert(null), 8000)
+              // Forward every alert to the global LiveAlerts panel via a custom DOM event
+              data.safety_alerts.forEach(a => {
+                window.dispatchEvent(new CustomEvent('prahari:safety-alert', { detail: a }))
+              })
             }
             if (typeof data.open_vocabulary_active !== 'boolean') {
               setOpenVocabularyActive(false)
@@ -378,7 +388,7 @@ export default function LiveVisionPanel({ time }) {
   // Filter detections based on user selection
   const visibleDetections = currentDetections.filter(d => {
     const isPerson = isPersonDetection(d)
-    if (filterMode === 'critical') return isPerson && d.risk_level === 'critical'
+    if (filterMode === 'critical') return isPerson && isCriticalRiskDetection(d)
     if (filterMode === 'ppe') return isPerson  // Show only persons for PPE scan
     if (filterMode === 'ovs') return Boolean(d.open_vocabulary) && !isPerson
     return true  // 'all' shows everything: persons + objects
@@ -601,7 +611,7 @@ export default function LiveVisionPanel({ time }) {
           <svg className="proximity-vectors-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
             {visibleDetections.map((det) => {
               const hzCenter = activeHazardZone[0] || [35, 60]
-              const isCrit = det.risk_level === 'critical'
+              const isCrit = isCriticalRiskDetection(det)
               const color = isCrit ? '#ef4444' : det.risk_level === 'warning' ? '#f59e0b' : '#10b981'
               return (
                 <g key={`vec-${det.track_id}`}>
@@ -631,7 +641,7 @@ export default function LiveVisionPanel({ time }) {
             ======================================================== */}
         {showOverlays && (selectedCam.id !== 'cam-webcam' || (webcamActive && isWsConnected)) && visibleDetections.map((det) => {
           const isPerson = det.is_person || det.class === 'Person' || det.class === 'person'
-          const isCritical = det.risk_level === 'critical'
+          const isCritical = isCriticalRiskDetection(det)
           const isWarning = det.risk_level === 'warning'
           const helmet = det.ppe?.helmet
           const vest = det.ppe?.vest

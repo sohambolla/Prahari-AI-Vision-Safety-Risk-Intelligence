@@ -28,7 +28,7 @@
       "critical_still_seconds": 5.0,
       "movement_tolerance_px": 12,
       "confirm_frames": 1,
-      "cooldown_seconds": 30
+      "cooldown_seconds": 15
     },
     "fire_smoke": {
       "enabled": true,
@@ -48,14 +48,14 @@
     },
     "ppe": {
       "enabled": true,
-      "confirm_frames": 4,
-      "cooldown_seconds": 30
+      "confirm_frames": 2,
+      "cooldown_seconds": 15
     },
     "vehicle_proximity": {
       "enabled": true,
       "distance_px": 120,
       "critical_distance_px": 50,
-      "confirm_frames": 3,
+      "confirm_frames": 2,
       "cooldown_seconds": 15
     },
     "exit_blocked": {
@@ -66,7 +66,7 @@
     },
     "restricted_zone": {
       "enabled": true,
-      "intrusion_confirm_frames": 4,
+      "intrusion_confirm_frames": 2,
       "suspicious_labels": ["weapon", "ammo box", "unattended bag", "bag"],
       "suspicious_dwell_seconds": 10,
       "owner_distance_px": 100,
@@ -80,9 +80,9 @@
     "machine_touch": {
       "enabled": true,
       "minimum_overlap_iou": 0.05,
-      "confirm_frames": 4,
+      "confirm_frames": 2,
       "max_track_gap_seconds": 1.5,
-      "cooldown_seconds": 30
+      "cooldown_seconds": 15
     }
   },
   "site": {

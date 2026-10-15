@@ -24,11 +24,14 @@ except ImportError:
     YOLOE = None
 import uvicorn
 from prahari_safety.runtime import SafetyRuntime
+from prahari_safety.tracker import IoUFallbackTracker
 
 app = FastAPI(title="PRAHARI AI Vision Engine")
 safety_runtime = SafetyRuntime()
+live_fallback_tracker = IoUFallbackTracker()
 SAFETY_ALERT_CLIENTS = set()
-SEEN_INCIDENT_IDS = set()
+SEEN_INCIDENT_IDS = set()          # capped at _SEEN_IDS_MAX to prevent unbounded growth
+_SEEN_IDS_MAX = 2000               # trim when size exceeds this
 app.mount("/incidents", StaticFiles(directory=str(safety_runtime.store.root)), name="incidents")
 
 app.add_middleware(
@@ -355,6 +358,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
                         tracker.reset()
                     active_open_vocabulary_camera = camera_id
                     safety_runtime.risk_engine.reset(camera_id)
+                    live_fallback_tracker.reset(camera_id)
                 results = open_vocabulary_model.track(
                     frame,
                     persist=True,
@@ -478,7 +482,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
             conf = float(box.conf[0].cpu().numpy())
             cls_id = int(box.cls[0].cpu().numpy())
             tracking_confirmed = box.id is not None
-            track_id = int(box.id[0].cpu().numpy()) if tracking_confirmed else (i + 1)
+            track_id = int(box.id[0].cpu().numpy()) if tracking_confirmed else None
 
             # Replace a phone label only when the vehicle model finds a strongly
             # overlapping car/truck/bus/bike of its own with a matching box.
@@ -502,10 +506,11 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
             color = CATEGORY_COLORS.get(str(class_name).casefold(), CATEGORY_COLORS['default'])
 
             det = {
-                "track_id": f"OBJ-{track_id:02d}",
+                "track_id": f"OBJ-{track_id:02d}" if tracking_confirmed else None,
                 "class": class_name.title(),
                 "class_id": cls_id,
                 "confidence": round(conf * 100, 1),
+                "bbox": [x1, y1, x2, y2],
                 "x": x_pct,
                 "y": y_pct,
                 "w": w_pct,
@@ -520,12 +525,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
 
             # For Person detections, add PPE sub-checks
             if is_person:
-                det["track_id"] = f"TRK-{track_id:02d}"
-
-                if track_id not in track_first_seen:
-                    track_first_seen[track_id] = time.time()
-                dwell_sec = round(time.time() - track_first_seen[track_id], 1)
-                det["dwell_time"] = dwell_sec
+                det["track_id"] = f"TRK-{track_id:02d}" if tracking_confirmed else None
 
                 foot_x = round(((x1 + x2) / 2 / w) * 100, 2)
                 foot_y = round((y2 / h) * 100, 2)
@@ -565,10 +565,9 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
                 if has_helmet and has_vest:
                     risk_level = "safe"
                     person_color = "#00e676"  # Vibrant Neon Green
-                elif has_helmet or has_vest:
-                    risk_level = "warning"
-                    person_color = "#ffea00"  # Vibrant Neon Amber
                 else:
+                    # The risk engine treats either missing required item as a
+                    # critical PPE violation; keep the live overlay consistent.
                     risk_level = "critical"
                     person_color = "#ff1744"  # Vibrant Neon Red
 
@@ -599,6 +598,13 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
 
             all_detections.append(det)
 
+    all_detections = live_fallback_tracker.update(camera_id, all_detections)
+    for detection in all_detections:
+        if detection.get("is_person") and detection.get("tracking_confirmed") and detection.get("track_id"):
+            track_id = detection["track_id"]
+            if track_id not in track_first_seen:
+                track_first_seen[track_id] = time.time()
+            detection["dwell_time"] = round(time.time() - track_first_seen[track_id], 1)
     inference_ms = round((time.time() - start_t) * 1000, 1)
     return all_detections, inference_ms, use_open_vocabulary
 
@@ -620,20 +626,55 @@ def read_root():
 
 
 async def broadcast_safety_message(message):
-    if message.get("type") == "incident" and isinstance(message.get("incident"), dict):
+    if message.get("type") in ("incident", "incident_update") and isinstance(message.get("incident"), dict):
         event_id = message["incident"].get("event_id") or message["incident"].get("id")
         if event_id:
-            if event_id in SEEN_INCIDENT_IDS:
+            if message.get("type") == "incident" and event_id in SEEN_INCIDENT_IDS:
+                print(f"[ALERT] Skipping duplicate event_id: {event_id}")
                 return
             SEEN_INCIDENT_IDS.add(event_id)
+            # Prevent unbounded growth – trim oldest half when cap is reached
+            if len(SEEN_INCIDENT_IDS) > _SEEN_IDS_MAX:
+                to_remove = list(SEEN_INCIDENT_IDS)[:_SEEN_IDS_MAX // 2]
+                for eid in to_remove:
+                    SEEN_INCIDENT_IDS.discard(eid)
     disconnected = []
-    for client in tuple(SAFETY_ALERT_CLIENTS):
+    clients = tuple(SAFETY_ALERT_CLIENTS)
+    print(f"[ALERT] Broadcasting '{message.get('type')}' to {len(clients)} client(s)")
+    for client in clients:
         try:
             await client.send_json(message)
-        except Exception:
+        except Exception as exc:
+            print(f"[ALERT] Failed to send to client: {exc}")
             disconnected.append(client)
     for client in disconnected:
         SAFETY_ALERT_CLIENTS.discard(client)
+
+
+@app.get("/api/debug/pipeline")
+def debug_pipeline():
+    """Quick health-check for the live-alert pipeline."""
+    last_events = safety_runtime.list_events(limit=10)
+    return {
+        "ws_clients_connected": len(SAFETY_ALERT_CLIENTS),
+        "seen_incident_ids_count": len(SEEN_INCIDENT_IDS),
+        "last_10_events": [
+            {
+                "event_id": e.get("event_id"),
+                "event_type": e.get("event_type"),
+                "severity": e.get("severity"),
+                "camera_id": e.get("camera_id"),
+                "timestamp": e.get("timestamp"),
+                "status": e.get("status"),
+            }
+            for e in last_events
+        ],
+        "risk_rules_enabled": {
+            name: safety_runtime.risk_engine.rules.get(name, {}).get("enabled", True)
+            for name in ("person_down", "ppe", "fire_smoke", "vehicle_proximity",
+                         "restricted_zone", "falling_object", "exit_blocked")
+        },
+    }
 
 
 @app.get("/api/safety/events")
@@ -736,6 +777,7 @@ def register_identity_presence(payload: dict = Body(...), authorization: str | N
 async def websocket_safety_alerts(websocket: WebSocket):
     await websocket.accept()
     SAFETY_ALERT_CLIENTS.add(websocket)
+    print(f"[WS] Safety-alert client connected. Total clients: {len(SAFETY_ALERT_CLIENTS)}")
     try:
         while True:
             await websocket.receive_text()
@@ -743,6 +785,7 @@ async def websocket_safety_alerts(websocket: WebSocket):
         pass
     finally:
         SAFETY_ALERT_CLIENTS.discard(websocket)
+        print(f"[WS] Safety-alert client disconnected. Remaining clients: {len(SAFETY_ALERT_CLIENTS)}")
 
 
 async def _auto_escalate_loop():
@@ -760,8 +803,10 @@ async def _auto_escalate_loop():
 async def _external_incident_poll_loop():
     """Forward incidents written by securade.py or another local process."""
     try:
-        SEEN_INCIDENT_IDS.update(event.get("event_id") for event in safety_runtime.list_events(limit=200)
-                                 if event.get("event_id"))
+        # Seed SEEN_INCIDENT_IDS with all existing events so we don't replay history on boot
+        existing = safety_runtime.list_events(limit=200)
+        SEEN_INCIDENT_IDS.update(e.get("event_id") for e in existing if e.get("event_id"))
+        print(f"[POLL] Seeded {len(SEEN_INCIDENT_IDS)} existing incident IDs from store")
     except Exception as exc:
         print(f"[WARN] Initial incident history scan failed: {exc}")
     while True:
@@ -769,7 +814,10 @@ async def _external_incident_poll_loop():
             events = safety_runtime.list_events(limit=200)
             for event in reversed(events):
                 event_id = event.get("event_id")
+                # Only broadcast events NOT already seen – broadcast_safety_message also
+                # checks SEEN_INCIDENT_IDS but we guard here to avoid redundant log spam.
                 if event_id and event_id not in SEEN_INCIDENT_IDS:
+                    print(f"[POLL] New external incident detected: {event_id} ({event.get('event_type')})")
                     await broadcast_safety_message({"type": "incident", "incident": event})
         except Exception as exc:
             print(f"[WARN] External incident poll failed: {exc}")

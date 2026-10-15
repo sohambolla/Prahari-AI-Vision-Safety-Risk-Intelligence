@@ -93,6 +93,16 @@ function App() {
     }
   }, [apiBase, handleSafetyAlert])
 
+  // ── Vision-stream alerts ──────────────────────────────────────────────────
+  // LiveVisionPanel dispatches a custom DOM event for each safety_alerts entry
+  // returned inline inside the per-camera WS frame. Wire them into the same
+  // global handleSafetyAlert handler so they appear in the LiveAlerts panel.
+  useEffect(() => {
+    const onVisionAlert = (e) => handleSafetyAlert(e.detail)
+    window.addEventListener('prahari:safety-alert', onVisionAlert)
+    return () => window.removeEventListener('prahari:safety-alert', onVisionAlert)
+  }, [handleSafetyAlert])
+
   const refreshSafetyAlerts = useCallback(async () => {
     try {
       const response = await fetch(`${apiBase}/api/safety/events?limit=200`)

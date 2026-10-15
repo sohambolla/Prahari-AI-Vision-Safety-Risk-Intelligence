@@ -111,7 +111,24 @@ class RiskEngine:
     def _state(self, camera_id, detection, class_name, timestamp):
         track_id = detection.get("track_id") or detection.get("tracker_id")
         if not track_id or detection.get("tracking_confirmed") is False:
-            return None, None
+            # No stable tracker ID (first sighting, YOLO ID flicker, compressed
+            # live stream). Fall back to a position-quantized key so temporal
+            # rules (PPE confirm_frames, person_down, zone dwell) can still
+            # accumulate instead of dropping every untracked detection.
+            # 40px grid keeps nearby frames on the same key without merging
+            # distinct people across the frame.
+            try:
+                box = _box(detection, 960.0, 540.0)
+                if box is None:
+                    return None, None
+                cx = int(((box[0] + box[2]) / 2.0) // 40)
+                cy = int(((box[1] + box[3]) / 2.0) // 40)
+                key = (str(camera_id), f"pos-{cx}x{cy}", _label(class_name))
+            except Exception:
+                return None, None
+            state = self._tracks.setdefault(key, _TrackState())
+            state.last_seen = timestamp
+            return key, state
         key = (str(camera_id), str(track_id), _label(class_name))
         state = self._tracks.setdefault(key, _TrackState())
         gap = timestamp - state.last_seen if state.last_seen else None
@@ -374,7 +391,7 @@ class RiskEngine:
             max_gap = float(self.config.get("max_track_gap_seconds", 1.5))
             count = prior_count + 1 if prior_count and now - prior_ts <= max_gap else 1
             self._confirm[key] = (now, count)
-            if count < candidate["_required_frames"] or (key in previously_active and key in self._last_emitted):
+            if count < candidate["_required_frames"]:
                 continue
             rule_config = self._rule(candidate["evidence"]["rule"])
             cooldown = float(rule_config.get("cooldown_seconds", 15.0))
