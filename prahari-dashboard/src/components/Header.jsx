@@ -4,7 +4,7 @@ import {
   ChevronRight, Play, Pause, SkipForward, SkipBack, Volume2,
   TrendingUp, BarChart3, Layers, Cpu, Bell, Settings, Search,
   RefreshCw, Maximize2, ArrowUpRight, CircleDot, Construction,
-  Cctv, MonitorPlay
+  Cctv, MonitorPlay, LayoutDashboard
 } from 'lucide-react'
 import './Header.css'
 
@@ -51,6 +51,9 @@ export default function Header({ time, date }) {
       {/* Right side: Time + Controls */}
       <div className="header-right">
         <div className="header-actions">
+          <a className="header-btn" href="/ui-examples" title="Compare dashboard UI options" aria-label="Compare dashboard UI options">
+            <LayoutDashboard size={16} />
+          </a>
           <button className="header-btn" title="Search"><Search size={16} /></button>
           <button className="header-btn notification-btn" title="Notifications">
             <Bell size={16} />

@@ -2,7 +2,20 @@
 .alerts-card {
   display: flex;
   flex-direction: column;
-  max-height: 420px;
+  width: 100%;
+  height: var(--live-scanner-height, 420px);
+  max-height: var(--live-scanner-height, 420px);
+  min-height: 0;
+}
+
+.live-alerts-slot {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.live-alerts-slot > .alerts-card {
+  flex: 1 1 auto;
 }
 
 .view-all-btn {
@@ -55,6 +68,7 @@
   gap: 8px;
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
   padding-right: 4px;
 }
 

@@ -294,7 +294,6 @@
   z-index: 4;
 }
 
-.segmentation-mask-layer,
 .object-trail-layer {
   position: absolute;
   inset: 0;
@@ -359,6 +358,49 @@
   pointer-events: none;
   transition: all 0.05s linear;
 }
+
+.person-detection-tag {
+  position: absolute;
+  z-index: 7;
+  transform: translateY(-100%);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  max-width: 48%;
+  padding: 3px 6px;
+  border: 1px solid rgba(192, 132, 252, 0.72);
+  border-radius: 4px;
+  background: rgba(20, 12, 33, 0.88);
+  color: #f3e8ff;
+  font: 700 0.59rem/1.25 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
+}
+
+.person-detection-id {
+  color: #d8b4fe;
+}
+
+.person-detection-class {
+  color: #f3e8ff;
+}
+
+.person-detection-confidence {
+  color: rgba(243, 232, 255, 0.72);
+}
+
+.person-ppe-status {
+  display: inline-flex;
+  gap: 0.28rem;
+  padding-left: 0.34rem;
+  border-left: 1px solid rgba(216, 180, 254, 0.35);
+}
+
+.ppe-status-ok { color: #86efac; }
+.ppe-status-missing { color: #fca5a5; }
+.ppe-status-unknown { color: #cbd5e1; }
 
 .bbox-critical {
   border-color: #ff1744 !important;

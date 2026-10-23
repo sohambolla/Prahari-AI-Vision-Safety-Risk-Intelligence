@@ -1,9 +1,6 @@
 """
 PRAHARI AI Vision - Real-Time Multi-Class YOLO Detection + WebSocket Server
-Enhanced with:
-1. Robust Hardhat / Helmet discrimination (Hair/Skin vs Industrial Polymer Hardhat)
-2. Fluorescent Hi-Vis Safety Vest discrimination (Neon Green/Orange vs casual clothing)
-3. High-Voltage Bright Neon Bounding Box Colors (#ff1744 Red, #00e676 Green, #00e5ff Cyan)
+Uses a fine-tuned construction PPE detector for hardhat and safety-vest checks.
 """
 
 import asyncio
@@ -14,10 +11,11 @@ import math
 import numpy as np
 import os
 import time
+from pathlib import Path
 from fastapi import Body, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from ultralytics import YOLO, YOLOWorld
+from ultralytics import YOLO
 try:
     from ultralytics import YOLOE
 except ImportError:
@@ -42,30 +40,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model (detects all 80 COCO classes)
-model = YOLO("yolo11n.pt")
+# Load the base model for a graceful person-only fallback, then the locally
+# fine-tuned PPE detector when training has produced its checkpoint.
+BASE_DIR = Path(__file__).resolve().parent
+model = YOLO(str(BASE_DIR / "yolo11n.pt"))
 COCO_NAMES = model.names
-COCO_ID_BY_NAME = {name: class_id for class_id, name in COCO_NAMES.items()}
-VEHICLE_CLASS_NAMES = ["car", "truck", "bus"]
-VEHICLE_CONFIRMATION_MIN_CONF = 0.30
-VEHICLE_CONFIRMATION_MIN_IOU = 0.50
-
-# Verify COCO phone detections against the project's existing open-vocabulary
-# vehicle model. This is only called when YOLO11n proposes a cell phone.
-vehicle_model = None
-vehicle_model_path = os.path.join(os.path.dirname(__file__), "yolov8s-world.pt")
-if os.path.isfile(vehicle_model_path):
+PPE_MODEL_PATH = Path(os.environ.get("PRAHARI_PPE_MODEL", str(BASE_DIR / "weights" / "ppe-yolo11n.pt")))
+if not PPE_MODEL_PATH.is_absolute():
+    PPE_MODEL_PATH = BASE_DIR / PPE_MODEL_PATH
+ppe_model = None
+ppe_model_error = ""
+if PPE_MODEL_PATH.is_file():
     try:
-        vehicle_model = YOLOWorld(vehicle_model_path)
-        vehicle_model.set_classes(VEHICLE_CLASS_NAMES)
-        vehicle_model.predict(np.zeros((360, 640, 3), dtype=np.uint8), verbose=False, conf=VEHICLE_CONFIRMATION_MIN_CONF)
+        ppe_model = YOLO(str(PPE_MODEL_PATH))
     except Exception as exc:
-        vehicle_model = None
-        print(f"[WARN] Vehicle confirmation model unavailable: {exc}")
-
-MODEL_LABEL = "YOLO11n"
-if vehicle_model is not None:
-    MODEL_LABEL += " + vehicle verification"
+        ppe_model_error = str(exc)
+        print(f"[WARN] Fine-tuned PPE model unavailable: {exc}")
+MODEL_LABEL = "CSS v28 PPE detector" if ppe_model is not None else "YOLO11n person fallback"
 
 open_vocabulary_model = None
 open_vocabulary_error = ""
@@ -76,21 +67,23 @@ if YOLOE is not None:
     try:
         ovs_model_path = os.environ.get("PRAHARI_OVS_MODEL", "weights/yoloe-11s-seg.pt")
         open_vocabulary_model = YOLOE(ovs_model_path)
-        MODEL_LABEL += " + YOLOE segmentation"
     except Exception as exc:
         open_vocabulary_error = str(exc)
         print(f"[WARN] Open-vocabulary segmentation unavailable: {exc}")
 else:
-    open_vocabulary_error = "Install ultralytics 8.4.0 or newer to enable YOLOE segmentation."
+    open_vocabulary_error = "Install ultralytics 8.4.0 or newer to enable YOLOE object detection."
+
+if open_vocabulary_model is not None:
+    MODEL_LABEL += " + optional YOLOE object detection"
 
 try:
-    OVS_IMAGE_SIZE = min(1280, max(640, int(os.environ.get("PRAHARI_OVS_IMGSZ", "960"))))
+    OVS_IMAGE_SIZE = min(1280, max(640, int(os.environ.get("PRAHARI_OVS_IMGSZ", "640"))))
 except ValueError:
-    OVS_IMAGE_SIZE = 960
+    OVS_IMAGE_SIZE = 640
 
 # Object category color mapping (Ultra-bright vibrant neon palette)
 CATEGORY_COLORS = {
-    'person': '#ff1744',      # Default red until PPE verified
+    'person': '#a855f7',      # Purple person segmentation
     'bicycle': '#ff9100',
     'car': '#ff1744',
     'motorcycle': '#ff9100',
@@ -113,8 +106,14 @@ CATEGORY_COLORS = {
     'default': '#00e5ff',
 }
 
-PERSON_CLASS_ID = 0
-AMBIGUOUS_PHONE_CLASS = COCO_ID_BY_NAME.get("cell phone")
+COCO_PERSON_CLASS_ID = 0
+PPE_LABEL_STATES = {
+    "hardhat": ("helmet", True),
+    "no hardhat": ("helmet", False),
+    "no safety vest": ("vest", False),
+    "safety vest": ("vest", True),
+}
+active_ppe_camera = None
 
 
 def box_iou(box1, box2):
@@ -129,84 +128,126 @@ def box_iou(box1, box2):
     union = area1 + area2 - intersection
     return intersection / union if union > 0 else 0.0
 
-def analyze_head_ppe(head_crop):
-    """
-    Robust Computer Vision filter to distinguish:
-    - Normal Human Hair / Exposed Head / Skin -> NO HARDHAT
-    - Industrial Safety Hardhats (Saturated Yellow, Orange, Blue, Red) -> HARDHAT DETECTED
-    """
-    if head_crop is None or head_crop.size == 0 or head_crop.shape[0] < 8 or head_crop.shape[1] < 8:
-        return False, 0.0
+def normalize_ppe_label(label):
+    return " ".join(str(label).casefold().replace("_", " ").replace("-", " ").split())
 
-    hsv = cv2.cvtColor(head_crop, cv2.COLOR_BGR2HSV)
-    total_p = head_crop.shape[0] * head_crop.shape[1]
 
-    # 1. Dark Hair Mask (black / dark brown hair)
-    dark_hair_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 75]))
+def ppe_detection_class_ids():
+    """Select only person, hardhat, and safety-vest classes from the PPE model."""
+    if ppe_model is None:
+        return []
+    names = ppe_model.names
+    entries = names.items() if isinstance(names, dict) else enumerate(names)
+    allowed_labels = {"person", *PPE_LABEL_STATES}
+    return [
+        int(class_id)
+        for class_id, label in entries
+        if normalize_ppe_label(label) in allowed_labels
+    ]
 
-    # 2. Exposed Facial Skin / Forehead Mask
-    skin_mask = cv2.inRange(hsv, np.array([0, 30, 60]), np.array([25, 160, 240]))
 
-    # 3. Industrial Safety Hardhat Colors (High saturation + High brightness)
-    # Industrial Safety Yellow
-    yellow_hat = cv2.inRange(hsv, np.array([18, 110, 110]), np.array([36, 255, 255]))
-    # Industrial Safety Orange
-    orange_hat = cv2.inRange(hsv, np.array([7, 140, 130]), np.array([18, 255, 255]))
-    # Industrial Safety Blue
-    blue_hat = cv2.inRange(hsv, np.array([95, 120, 90]), np.array([130, 255, 255]))
-    # Industrial Safety Red
-    red_hat1 = cv2.inRange(hsv, np.array([0, 150, 110]), np.array([6, 255, 255]))
-    red_hat2 = cv2.inRange(hsv, np.array([172, 150, 110]), np.array([180, 255, 255]))
-    red_hat = cv2.bitwise_or(red_hat1, red_hat2)
+def ppe_evidence_for_person(person_box, candidates):
+    """Associate explicit CSS v28 PPE detections with one person; no box means unknown."""
+    px1, py1, px2, py2 = [float(value) for value in person_box]
+    person_w = max(1.0, px2 - px1)
+    person_h = max(1.0, py2 - py1)
+    evidence = {"helmet": None, "vest": None}
+    confidence = {"helmet": None, "vest": None}
 
-    hat_mask = yellow_hat | orange_hat | blue_hat | red_hat
+    for candidate in candidates:
+        state = PPE_LABEL_STATES.get(normalize_ppe_label(candidate["label"]))
+        if state is None:
+            continue
+        category, detected = state
+        x1, y1, x2, y2 = candidate["bbox"]
+        gear_area = max(1.0, (x2 - x1) * (y2 - y1))
+        ix1, iy1 = max(px1, x1), max(py1, y1)
+        ix2, iy2 = min(px2, x2), min(py2, y2)
+        intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        relative_y = (center_y - py1) / person_h
+        if intersection / gear_area < 0.5 or not (px1 <= center_x <= px2):
+            continue
+        if category == "helmet" and relative_y > 0.42:
+            continue
+        if category == "vest" and not (0.18 <= relative_y <= 0.90):
+            continue
 
-    hat_pixels = cv2.countNonZero(hat_mask)
-    hair_pixels = cv2.countNonZero(dark_hair_mask)
-    skin_pixels = cv2.countNonZero(skin_mask)
+        score = float(candidate["confidence"])
+        if confidence[category] is None or score > confidence[category]:
+            evidence[category] = detected
+            confidence[category] = score
 
-    hat_ratio = hat_pixels / max(1, total_p)
-    hair_ratio = hair_pixels / max(1, total_p)
+    return {
+        category: {
+            "detected": evidence[category],
+            "confidence": round(confidence[category] * 100, 1) if confidence[category] is not None else None,
+            "type": ("Detected" if evidence[category] else "Not detected") if evidence[category] is not None else "Unknown",
+        }
+        for category in evidence
+    }
 
-    # If top of the head is dominated by exposed hair or skin, NO helmet
-    if hair_ratio > 0.20 or (hair_pixels + skin_pixels) > (hat_pixels * 1.5):
-        return False, 0.0
 
-    # Must have at least 22% coverage of saturated industrial helmet polymer
-    if hat_ratio >= 0.22 and hat_pixels > (hair_pixels * 1.2):
-        conf = round(min(99.0, 72.0 + hat_ratio * 100), 1)
-        return True, conf
+def deduplicate_person_rows(rows):
+    """Remove the nested duplicate person annotations common in CSS v28."""
+    kept = []
+    for candidate in sorted(rows, key=lambda row: row["confidence"], reverse=True):
+        x1, y1, x2, y2 = candidate["bbox"]
+        candidate_area = max(1.0, (x2 - x1) * (y2 - y1))
+        duplicate = False
+        for prior in kept:
+            px1, py1, px2, py2 = prior["bbox"]
+            prior_area = max(1.0, (px2 - px1) * (py2 - py1))
+            intersection = max(0.0, min(x2, px2) - max(x1, px1)) * max(0.0, min(y2, py2) - max(y1, py1))
+            smaller_area = min(candidate_area, prior_area)
+            containment = intersection / smaller_area
+            area_ratio = smaller_area / max(candidate_area, prior_area)
+            if box_iou(candidate["bbox"], prior["bbox"]) >= 0.78 or (containment >= 0.92 and area_ratio < 0.65):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(candidate)
+    return kept
 
-    return False, 0.0
 
-def analyze_torso_ppe(torso_crop):
-    """
-    Robust Computer Vision filter to distinguish:
-    - Normal casual clothes / shirts / t-shirts -> NO VEST
-    - Fluorescent Neon Hi-Vis Safety Vests (Day-glo Green / Day-glo Orange) -> SAFETY VEST DETECTED
-    """
-    if torso_crop is None or torso_crop.size == 0 or torso_crop.shape[0] < 10 or torso_crop.shape[1] < 10:
-        return False, 0.0
-
-    hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
-    total_t = torso_crop.shape[0] * torso_crop.shape[1]
-
-    # Fluorescent Hi-Vis Neon Yellow/Green
-    hivis_green = cv2.inRange(hsv, np.array([28, 130, 150]), np.array([55, 255, 255]))
-
-    # Fluorescent Hi-Vis Day-Glo Orange
-    hivis_orange = cv2.inRange(hsv, np.array([8, 160, 160]), np.array([18, 255, 255]))
-
-    vest_mask = hivis_green | hivis_orange
-    vest_pixels = cv2.countNonZero(vest_mask)
-    vest_ratio = vest_pixels / max(1, total_t)
-
-    # Must cover at least 22% of torso in neon high-luminance colors
-    if vest_ratio >= 0.22:
-        conf = round(min(99.0, 70.0 + vest_ratio * 100), 1)
-        return True, conf
-
-    return False, 0.0
+def assign_ppe_candidates_to_people(people, candidates):
+    """Give each PPE box to its best overlapping person so adjacent workers do not share PPE."""
+    assigned = [[] for _ in people]
+    for candidate in candidates:
+        state = PPE_LABEL_STATES.get(normalize_ppe_label(candidate["label"]))
+        if state is None:
+            continue
+        category, _ = state
+        x1, y1, x2, y2 = candidate["bbox"]
+        gear_area = max(1.0, (x2 - x1) * (y2 - y1))
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        best_index = None
+        best_score = -1.0
+        for index, person in enumerate(people):
+            px1, py1, px2, py2 = person["bbox"]
+            ix1, iy1 = max(px1, x1), max(py1, y1)
+            ix2, iy2 = min(px2, x2), min(py2, y2)
+            intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            overlap = intersection / gear_area
+            person_h = max(1.0, py2 - py1)
+            relative_y = (center_y - py1) / person_h
+            if overlap < 0.5 or not (px1 <= center_x <= px2):
+                continue
+            if category == "helmet" and relative_y > 0.42:
+                continue
+            if category == "vest" and not (0.18 <= relative_y <= 0.90):
+                continue
+            relative_x = (center_x - px1) / max(1.0, px2 - px1)
+            target_y = {"helmet": 0.18, "vest": 0.52}[category]
+            score = overlap - abs(relative_x - 0.5) * 0.12 - abs(relative_y - target_y) * 0.08
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index is not None:
+            assigned[best_index].append(candidate)
+    return assigned
 
 def normalize_open_vocabulary_prompts(prompts):
     """Return a bounded, de-duplicated prompt list received from the dashboard."""
@@ -246,11 +287,6 @@ OPEN_VOCABULARY_SYNONYMS = {
     "washer": ("metal washer",),
 }
 MAX_EXPANDED_OVS_PROMPTS = 18
-SAFETY_MONITOR_PROMPTS = (
-    "fire", "smoke", "suspended load", "forklift", "safety helmet", "safety vest",
-    "safety gloves", "door", "conveyor belt", "handrail", "MEWP", "weapon",
-    "ammo box", "unattended bag", "machine",
-)
 SCREEN_PROMPT_TERMS = {
     "screen", "monitor", "display", "computer monitor", "computer screen", "computer display",
 }
@@ -297,32 +333,13 @@ def canonicalize_open_vocabulary_label(label, requested_prompts):
     return label
 
 
-def mask_polygon_for_result(result, detection_index, width, height):
-    """Convert an instance mask contour to a compact 0..100 SVG polygon."""
-    if result.masks is None or detection_index >= len(result.masks.xy):
-        return None
-    contour = result.masks.xy[detection_index]
-    if contour is None or len(contour) < 3:
-        return None
-
-    contour = np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2)
-    perimeter = cv2.arcLength(contour, True)
-    simplified = cv2.approxPolyDP(contour, max(1.5, perimeter * 0.005), True).reshape(-1, 2)
-    if len(simplified) < 3:
-        return None
-    return [
-        [round(float(x) / width * 100, 2), round(float(y) / height * 100, 2)]
-        for x, y in simplified[:120]
-    ]
-
-
 def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15, camera_id=None):
-    """Track fixed COCO objects or text-prompted instances and analyze PPE."""
+    """Detect people, check hardhat/vest PPE, and optionally detect prompted objects."""
     global active_open_vocabulary_prompts, active_open_vocabulary_camera
-    global failed_open_vocabulary_prompts, open_vocabulary_error
-    h, w = frame.shape[:2]
-    start_t = time.time()
+    global failed_open_vocabulary_prompts, open_vocabulary_error, active_ppe_camera
 
+    height, width = frame.shape[:2]
+    start_t = time.time()
     prompts = normalize_open_vocabulary_prompts(target_prompts)
     try:
         confidence = min(0.75, max(0.05, float(confidence)))
@@ -330,273 +347,225 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
         confidence = 0.15
     if not math.isfinite(confidence):
         confidence = 0.15
-    # Keep the safety rule engine supplied with its core visual classes while
-    # still accepting arbitrary operator prompts in the same segmentation pass.
-    use_open_vocabulary = bool((prompts or SAFETY_MONITOR_PROMPTS) and open_vocabulary_model is not None)
-    if use_open_vocabulary:
-        expanded_prompts = expand_open_vocabulary_prompts(prompts)
-        classes = ["person", *expanded_prompts]
-        seen_classes = {label.casefold() for label in classes}
-        for label in SAFETY_MONITOR_PROMPTS:
-            if label.casefold() not in seen_classes:
-                classes.append(label)
-                seen_classes.add(label.casefold())
-        if classes == failed_open_vocabulary_prompts:
-            use_open_vocabulary = False
-        else:
-            try:
-                prompts_changed = classes != active_open_vocabulary_prompts
-                camera_changed = camera_id != active_open_vocabulary_camera
-                if prompts_changed:
-                    open_vocabulary_model.set_classes(classes)
-                    active_open_vocabulary_prompts = classes
-                    failed_open_vocabulary_prompts = []
-                    open_vocabulary_error = ""
-                if prompts_changed or camera_changed:
-                    predictor = getattr(open_vocabulary_model, "predictor", None)
-                    for tracker in getattr(predictor, "trackers", []):
-                        tracker.reset()
-                    active_open_vocabulary_camera = camera_id
-                    safety_runtime.risk_engine.reset(camera_id)
-                    live_fallback_tracker.reset(camera_id)
-                results = open_vocabulary_model.track(
-                    frame,
-                    persist=True,
-                    verbose=False,
-                    conf=confidence,
-                    imgsz=OVS_IMAGE_SIZE,
-                    tracker="configs/prahari_ovs_tracker.yaml",
-                )
-            except Exception as exc:
-                open_vocabulary_error = str(exc)
-                failed_open_vocabulary_prompts = classes
-                print(f"[WARN] Open-vocabulary prompt inference failed: {exc}")
-                use_open_vocabulary = False
 
-    if not use_open_vocabulary:
-        # Keep the proven COCO/PPE pipeline available when no prompt is selected
-        # or when the optional open-vocabulary model cannot initialize.
-        results = model.track(frame, persist=True, verbose=False, conf=0.25)
+    camera_changed = camera_id != active_ppe_camera
+    if camera_changed:
+        tracker_model = ppe_model or model
+        predictor = getattr(tracker_model, "predictor", None)
+        for tracker in getattr(predictor, "trackers", []):
+            tracker.reset()
+        active_ppe_camera = camera_id
+        safety_runtime.risk_engine.reset(camera_id)
+        live_fallback_tracker.reset(camera_id)
 
-    all_detections = []
-    vehicle_overrides = {}
+    # The fine-tuned detector returns both person tracks and explicit PPE boxes.
+    # Without its checkpoint, fall back to person-only COCO detections and keep
+    # PPE status unknown instead of guessing from pixel color.
+    person_rows = []
+    ppe_candidates = []
+    ppe_inference_failed = False
+    if ppe_model is not None:
+        try:
+            ppe_results = ppe_model.track(
+                frame,
+                persist=True,
+                verbose=False,
+                conf=0.15,
+                imgsz=640,
+                classes=ppe_detection_class_ids(),
+                tracker="configs/prahari_ovs_tracker.yaml",
+            )
+            ppe_result = ppe_results[0] if ppe_results else None
+            if ppe_result is not None and ppe_result.boxes is not None:
+                names = ppe_result.names
+                for box in ppe_result.boxes:
+                    xyxy = [float(value) for value in box.xyxy[0].cpu().tolist()]
+                    class_id = int(box.cls[0].cpu().item())
+                    label = str(names.get(class_id, class_id))
+                    row = {
+                        "bbox": xyxy,
+                        "class_id": class_id,
+                        "label": label,
+                        "confidence": float(box.conf[0].cpu().item()),
+                        "track_id": int(box.id[0].cpu().item()) if box.id is not None else None,
+                    }
+                    if normalize_ppe_label(label) == "person":
+                        if row["confidence"] >= 0.20:
+                            person_rows.append(row)
+                    elif normalize_ppe_label(label) in PPE_LABEL_STATES and row["confidence"] >= 0.20:
+                        ppe_candidates.append(row)
+        except Exception as exc:
+            print(f"[WARN] Fine-tuned PPE inference failed; using person-only fallback: {exc}")
+            person_rows = []
+            ppe_candidates = []
+            ppe_inference_failed = True
 
-    if results and len(results) > 0 and results[0].boxes is not None:
-        result = results[0]
-        boxes = result.boxes
-        result_names = result.names if use_open_vocabulary else COCO_NAMES
-        candidate_indices = list(range(len(boxes)))
+    if ppe_model is None or ppe_inference_failed:
+        fallback_results = model.track(
+            frame,
+            persist=True,
+            verbose=False,
+            conf=0.25,
+            imgsz=640,
+            classes=[COCO_PERSON_CLASS_ID],
+            tracker="configs/prahari_ovs_tracker.yaml",
+        )
+        fallback_result = fallback_results[0] if fallback_results else None
+        if fallback_result is not None and fallback_result.boxes is not None:
+            for box in fallback_result.boxes:
+                xyxy = [float(value) for value in box.xyxy[0].cpu().tolist()]
+                track_id = int(box.id[0].cpu().item()) if box.id is not None else None
+                person_rows.append({
+                    "bbox": xyxy,
+                    "class_id": COCO_PERSON_CLASS_ID,
+                    "label": "person",
+                    "confidence": float(box.conf[0].cpu().item()),
+                    "track_id": track_id,
+                })
+
+    person_rows = deduplicate_person_rows(person_rows)
+    ppe_by_person = assign_ppe_candidates_to_people(person_rows, ppe_candidates)
+
+    # Optional object prompts use YOLOE boxes. Person detection and PPE status
+    # come from the fine-tuned model, and the dashboard draws one box per person.
+    segment_result = None
+    use_open_vocabulary = False
+    segmentation_classes = expand_open_vocabulary_prompts(prompts)
+    if prompts and open_vocabulary_model is not None and segmentation_classes != failed_open_vocabulary_prompts:
+        try:
+            prompts_changed = segmentation_classes != active_open_vocabulary_prompts
+            if prompts_changed:
+                open_vocabulary_model.set_classes(segmentation_classes)
+                active_open_vocabulary_prompts = segmentation_classes
+                failed_open_vocabulary_prompts = []
+                open_vocabulary_error = ""
+            if prompts_changed or camera_changed or camera_id != active_open_vocabulary_camera:
+                predictor = getattr(open_vocabulary_model, "predictor", None)
+                for tracker in getattr(predictor, "trackers", []):
+                    tracker.reset()
+                active_open_vocabulary_camera = camera_id
+            segment_results = open_vocabulary_model.track(
+                frame,
+                persist=True,
+                verbose=False,
+                conf=confidence,
+                imgsz=OVS_IMAGE_SIZE,
+                tracker="configs/prahari_ovs_tracker.yaml",
+            )
+            segment_result = segment_results[0] if segment_results else None
+            use_open_vocabulary = bool(prompts and segment_result is not None)
+        except Exception as exc:
+            open_vocabulary_error = str(exc)
+            failed_open_vocabulary_prompts = segmentation_classes
+            print(f"[WARN] Optional object detection failed: {exc}")
+
+    optional_objects = []
+    if segment_result is not None and segment_result.boxes is not None:
+        segment_boxes = segment_result.boxes
+        segment_names = segment_result.names
         requested_labels = {prompt.casefold() for prompt in prompts}
-        internal_negative_labels = {
+        negative_labels = {
             label.casefold() for label in get_screen_hard_negatives(prompts)
             if label.casefold() not in requested_labels
-        } if use_open_vocabulary else set()
-
-        # Whiteboards and posters often look like screens to open-vocabulary
-        # prompts. Use those labels as internal counter-evidence and suppress a
-        # screen candidate when a matching negative box overlaps it strongly.
-        if use_open_vocabulary and internal_negative_labels and len(candidate_indices) > 1:
-            negative_indices = []
-            screen_indices = []
-            for index in candidate_indices:
-                candidate_class_id = int(boxes[index].cls[0].cpu().numpy())
-                candidate_label = str(result_names.get(candidate_class_id, "")).casefold()
-                if candidate_label in internal_negative_labels:
-                    negative_indices.append(index)
-                elif candidate_label in SCREEN_PROMPT_TERMS:
-                    screen_indices.append(index)
-
-            suppressed_screen_indices = set()
-            for screen_index in screen_indices:
-                screen_box = boxes[screen_index].xyxy[0].cpu().numpy()
-                screen_confidence = float(boxes[screen_index].conf[0].cpu().numpy())
-                for negative_index in negative_indices:
-                    negative_box = boxes[negative_index].xyxy[0].cpu().numpy()
-                    negative_confidence = float(boxes[negative_index].conf[0].cpu().numpy())
-                    if box_iou(screen_box, negative_box) >= 0.45 and negative_confidence >= max(0.20, screen_confidence * 0.60):
-                        suppressed_screen_indices.add(screen_index)
-                        break
-
-            candidate_indices = [
-                index for index in candidate_indices
-                if index not in suppressed_screen_indices
-                and not (
-                    int(boxes[index].cls[0].cpu().numpy()) in result_names
-                    and str(result_names[int(boxes[index].cls[0].cpu().numpy())]).casefold() in internal_negative_labels
-                )
-            ]
-
-        if use_open_vocabulary and len(candidate_indices) > 1:
-            # Prompt synonyms can return the same physical item under two
-            # labels. Suppress only near-identical boxes and keep the stronger one.
-            ranked = sorted(
-                candidate_indices,
-                key=lambda index: float(boxes[index].conf[0].cpu().numpy()),
-                reverse=True,
-            )
-            kept = []
-            for index in ranked:
-                candidate_box = boxes[index].xyxy[0].cpu().numpy()
-                if any(box_iou(candidate_box, boxes[other].xyxy[0].cpu().numpy()) > 0.82 for other in kept):
-                    continue
-                kept.append(index)
-            candidate_indices = kept
-
-        phone_candidates = []
-        if not use_open_vocabulary and vehicle_model is not None and AMBIGUOUS_PHONE_CLASS is not None:
-            phone_candidates = [
-                (index, box, box.xyxy[0].cpu().numpy())
-                for index, box in enumerate(boxes)
-                if int(box.cls[0].cpu().numpy()) == AMBIGUOUS_PHONE_CLASS
-            ]
-
-        if phone_candidates:
-            try:
-                vehicle_results = vehicle_model.predict(frame, verbose=False, conf=VEHICLE_CONFIRMATION_MIN_CONF)[0]
-                if vehicle_results.boxes is not None:
-                    for vehicle_box in vehicle_results.boxes:
-                        vehicle_cls_id = int(vehicle_box.cls[0].cpu().numpy())
-                        vehicle_name = vehicle_model.names.get(vehicle_cls_id, "vehicle")
-                        if vehicle_name not in VEHICLE_CLASS_NAMES:
-                            continue
-
-                        vehicle_conf = float(vehicle_box.conf[0].cpu().numpy())
-                        vehicle_xyxy = vehicle_box.xyxy[0].cpu().numpy()
-                        for phone_index, _, phone_xyxy in phone_candidates:
-                            overlap = box_iou(phone_xyxy, vehicle_xyxy)
-                            if overlap < VEHICLE_CONFIRMATION_MIN_IOU:
-                                continue
-                            if vehicle_conf > vehicle_overrides.get(phone_index, {}).get("confidence", 0):
-                                vehicle_overrides[phone_index] = {
-                                    "class_name": vehicle_name,
-                                    "class_id": COCO_ID_BY_NAME.get(vehicle_name, AMBIGUOUS_PHONE_CLASS),
-                                    "confidence": vehicle_conf,
-                                    "xyxy": vehicle_xyxy,
-                                }
-            except Exception as exc:
-                print(f"[WARN] Vehicle confirmation skipped for frame: {exc}")
-
-        for i in candidate_indices:
-            box = boxes[i]
-            xyxy = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            cls_id = int(box.cls[0].cpu().numpy())
-            tracking_confirmed = box.id is not None
-            track_id = int(box.id[0].cpu().numpy()) if tracking_confirmed else None
-
-            # Replace a phone label only when the vehicle model finds a strongly
-            # overlapping car/truck/bus/bike of its own with a matching box.
-            vehicle_override = vehicle_overrides.get(i)
-            if vehicle_override:
-                xyxy = vehicle_override["xyxy"]
-                conf = vehicle_override["confidence"]
-                cls_id = vehicle_override["class_id"]
-
-            x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
-
-            x_pct = round((x1 / w) * 100, 2)
-            y_pct = round((y1 / h) * 100, 2)
-            w_pct = round(((x2 - x1) / w) * 100, 2)
-            h_pct = round(((y2 - y1) / h) * 100, 2)
-
-            class_name = result_names.get(cls_id, f"class_{cls_id}")
-            if use_open_vocabulary:
-                class_name = canonicalize_open_vocabulary_label(class_name, prompts)
-            is_person = str(class_name).casefold() == "person"
-            color = CATEGORY_COLORS.get(str(class_name).casefold(), CATEGORY_COLORS['default'])
-
-            det = {
-                "track_id": f"OBJ-{track_id:02d}" if tracking_confirmed else None,
-                "class": class_name.title(),
-                "class_id": cls_id,
-                "confidence": round(conf * 100, 1),
-                "bbox": [x1, y1, x2, y2],
-                "x": x_pct,
-                "y": y_pct,
-                "w": w_pct,
-                "h": h_pct,
-                "color": color,
-                "is_person": is_person,
-                "tracking_confirmed": tracking_confirmed,
+        }
+        raw_optional = []
+        internal_negatives = []
+        for index, box in enumerate(segment_boxes):
+            xyxy = [float(value) for value in box.xyxy[0].cpu().tolist()]
+            class_id = int(box.cls[0].cpu().item())
+            label = str(segment_names.get(class_id, class_id))
+            if prompts:
+                label = canonicalize_open_vocabulary_label(label, prompts)
+            row = {
+                "index": index,
+                "bbox": xyxy,
+                "class_id": class_id,
+                "label": label,
+                "confidence": float(box.conf[0].cpu().item()),
+                "track_id": int(box.id[0].cpu().item()) if box.id is not None else None,
             }
             if use_open_vocabulary:
-                det["open_vocabulary"] = not is_person
-                det["mask_polygon"] = mask_polygon_for_result(result, i, w, h)
-
-            # For Person detections, add PPE sub-checks
-            if is_person:
-                det["track_id"] = f"TRK-{track_id:02d}" if tracking_confirmed else None
-
-                foot_x = round(((x1 + x2) / 2 / w) * 100, 2)
-                foot_y = round((y2 / h) * 100, 2)
-                det["foot_x"] = foot_x
-                det["foot_y"] = foot_y
-
-                # Head region coordinates (Top 22% of person height)
-                head_w = round(w_pct * 0.55, 2)
-                head_h = round(h_pct * 0.22, 2)
-                head_x = round(x_pct + (w_pct - head_w) / 2, 2)
-                head_y = round(y_pct, 2)
-
-                # Torso region coordinates (22% to 58% of person height)
-                vest_w = round(w_pct * 0.78, 2)
-                vest_h = round(h_pct * 0.36, 2)
-                vest_x = round(x_pct + (w_pct - vest_w) / 2, 2)
-                vest_y = round(y_pct + head_h + 1, 2)
-
-                # Pixel crops for analysis
-                hx1 = max(0, int(x1 + (x2 - x1) * 0.15))
-                hy1 = max(0, int(y1))
-                hx2 = min(w, int(x1 + (x2 - x1) * 0.85))
-                hy2 = min(h, int(y1 + (y2 - y1) * 0.24))
-
-                vx1 = max(0, int(x1 + (x2 - x1) * 0.10))
-                vy1 = max(0, int(y1 + (y2 - y1) * 0.22))
-                vx2 = min(w, int(x1 + (x2 - x1) * 0.90))
-                vy2 = min(h, int(y1 + (y2 - y1) * 0.58))
-
-                head_crop = frame[hy1:hy2, hx1:hx2] if (hy2 > hy1 and hx2 > hx1) else None
-                torso_crop = frame[vy1:vy2, vx1:vx2] if (vy2 > vy1 and vx2 > vx1) else None
-
-                has_helmet, helmet_conf = analyze_head_ppe(head_crop)
-                has_vest, vest_conf = analyze_torso_ppe(torso_crop)
-
-                # Risk level & dynamic glowing colors
-                if has_helmet and has_vest:
-                    risk_level = "safe"
-                    person_color = "#00e676"  # Vibrant Neon Green
+                if label.casefold() in negative_labels:
+                    internal_negatives.append(row)
                 else:
-                    # The risk engine treats either missing required item as a
-                    # critical PPE violation; keep the live overlay consistent.
-                    risk_level = "critical"
-                    person_color = "#ff1744"  # Vibrant Neon Red
+                    raw_optional.append(row)
 
-                det["risk_level"] = risk_level
-                det["color"] = person_color
-                det["ppe"] = {
-                    "helmet": {
-                        "detected": has_helmet,
-                        "confidence": helmet_conf,
-                        "type": "Hardhat Detected" if has_helmet else "NO HARDHAT",
-                        "box": {"x": head_x, "y": head_y, "w": head_w, "h": head_h}
-                    },
-                    "vest": {
-                        "detected": has_vest,
-                        "confidence": vest_conf,
-                        "type": "Hi-Vis Vest" if has_vest else "NO VEST",
-                        "box": {"x": vest_x, "y": vest_y, "w": vest_w, "h": vest_h}
-                    },
-                    "harness": {
-                        "detected": False,
-                        "confidence": 0.0,
-                        "type": "NOT DETECTED"
-                    }
-                }
-            else:
-                det["risk_level"] = "object"
-                det["color"] = "#00e5ff"  # Vibrant Neon Cyan for objects
+        # Avoid synonym boxes for the same object showing up as duplicates.
+        for row in sorted(raw_optional, key=lambda item: item["confidence"], reverse=True):
+            if row["label"].casefold() in SCREEN_PROMPT_TERMS and any(
+                box_iou(row["bbox"], negative["bbox"]) >= 0.45
+                and negative["confidence"] >= max(0.20, row["confidence"] * 0.60)
+                for negative in internal_negatives
+            ):
+                continue
+            if any(box_iou(row["bbox"], prior["bbox"]) > 0.82 for prior in optional_objects):
+                continue
+            optional_objects.append(row)
 
-            all_detections.append(det)
+    all_detections = []
+    for person_index, person in enumerate(person_rows):
+        x1, y1, x2, y2 = person["bbox"]
+        x1 = max(0.0, min(float(width), x1))
+        x2 = max(0.0, min(float(width), x2))
+        y1 = max(0.0, min(float(height), y1))
+        y2 = max(0.0, min(float(height), y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        ppe = ppe_evidence_for_person([x1, y1, x2, y2], ppe_by_person[person_index])
+        if ppe["helmet"]["detected"] is not True:
+            risk_level = "critical"
+        elif ppe["vest"]["detected"] is not True:
+            risk_level = "warning"
+        else:
+            risk_level = "safe"
+
+        track_id = person["track_id"]
+        person_detection = {
+            "track_id": f"TRK-{track_id:02d}" if track_id is not None else None,
+            "class": "Person",
+            "class_id": person["class_id"],
+            "confidence": round(person["confidence"] * 100, 1),
+            "bbox": [x1, y1, x2, y2],
+            "x": round(x1 / width * 100, 2),
+            "y": round(y1 / height * 100, 2),
+            "w": round((x2 - x1) / width * 100, 2),
+            "h": round((y2 - y1) / height * 100, 2),
+            "foot_x": round((x1 + x2) / (2 * width) * 100, 2),
+            "foot_y": round(y2 / height * 100, 2),
+            "color": {
+                "critical": "#ef4444",
+                "warning": "#facc15",
+                "safe": "#22c55e",
+            }[risk_level],
+            "is_person": True,
+            "tracking_confirmed": track_id is not None,
+            "risk_level": risk_level,
+            "ppe": ppe,
+        }
+
+        all_detections.append(person_detection)
+
+    for item in optional_objects:
+        x1, y1, x2, y2 = item["bbox"]
+        track_id = item["track_id"]
+        label = item["label"]
+        all_detections.append({
+            "track_id": f"OBJ-{track_id:02d}" if track_id is not None else None,
+            "class": str(label).title(),
+            "class_id": item["class_id"],
+            "confidence": round(item["confidence"] * 100, 1),
+            "bbox": [x1, y1, x2, y2],
+            "x": round(x1 / width * 100, 2),
+            "y": round(y1 / height * 100, 2),
+            "w": round((x2 - x1) / width * 100, 2),
+            "h": round((y2 - y1) / height * 100, 2),
+            "color": CATEGORY_COLORS.get(str(label).casefold(), CATEGORY_COLORS["default"]),
+            "is_person": False,
+            "tracking_confirmed": track_id is not None,
+            "risk_level": "object",
+            "open_vocabulary": True,
+        })
 
     all_detections = live_fallback_tracker.update(camera_id, all_detections)
     for detection in all_detections:
@@ -605,6 +574,7 @@ def process_frame(frame, track_first_seen, target_prompts=None, confidence=0.15,
             if track_id not in track_first_seen:
                 track_first_seen[track_id] = time.time()
             detection["dwell_time"] = round(time.time() - track_first_seen[track_id], 1)
+
     inference_ms = round((time.time() - start_t) * 1000, 1)
     return all_detections, inference_ms, use_open_vocabulary
 
@@ -615,9 +585,11 @@ def read_root():
         "vision_api": 2,
         "system": "PRAHARI AI Vision Intelligence Server",
         "version": "2.2.0",
-        "mode": "Live PPE and object detection",
+        "mode": "Live person and PPE detection with optional open-vocabulary equipment tracking",
         "classes": len(COCO_NAMES),
         "model": MODEL_LABEL,
+        "ppe_detector_loaded": ppe_model is not None,
+        "ppe_detector_error": ppe_model_error or None,
         "open_vocabulary_segmentation": open_vocabulary_model is not None,
         "open_vocabulary_error": open_vocabulary_error or None,
         "safety_runtime": "online",
@@ -878,7 +850,7 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
                             "timestamp": round(time.time(), 2),
                             "inference_ms": inference_ms,
                             "fps": round(1000 / max(1, inference_ms + 10), 1),
-                            "model": f"YOLOE-11s Seg + tracking" if ovs_active else MODEL_LABEL,
+                            "model": f"{MODEL_LABEL} + prompted YOLOE tracking" if ovs_active else MODEL_LABEL,
                             "open_vocabulary_active": ovs_active,
                             "open_vocabulary_error": open_vocabulary_error or None,
                             "confidence_threshold": confidence,
@@ -935,7 +907,7 @@ async def websocket_vision_feed(websocket: WebSocket, camera_id: str):
 if __name__ == "__main__":
     print("=" * 60)
     print("PRAHARI AI Vision Intelligence Server v2.2")
-    print(f"Live PPE & Object Detection ({MODEL_LABEL})")
+    print(f"Live Person & PPE Detection; Equipment Tracking Is Opt-In ({MODEL_LABEL})")
     print(f"Loaded {len(COCO_NAMES)} COCO classes")
     print("=" * 60)
     uvicorn.run("prahari_live_server:app", host="0.0.0.0", port=8000, reload=False)

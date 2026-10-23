@@ -5,7 +5,7 @@ import './LiveAlerts.css'
 const API_BASE = (import.meta.env.VITE_VISION_API_URL ||
   `${window.location.protocol}//${window.location.hostname || 'localhost'}:8000`).replace(/\/$/, '')
 
-export default function LiveAlerts({ alerts = [], onRefresh, onAction }) {
+export default function LiveAlerts({ alerts = [], onClear, onAction }) {
   const [showAll, setShowAll] = useState(false)
   const visibleAlerts = showAll ? alerts : alerts.slice(0, 8)
   return (
@@ -13,13 +13,10 @@ export default function LiveAlerts({ alerts = [], onRefresh, onAction }) {
       <div className="card-header">
         <span className="card-title">Live Safety Alerts</span>
         <div className="alerts-header-actions">
-          <button className="refresh-alerts-btn" onClick={onRefresh} title="Reload recent alerts from the safety server">
+          <button className="refresh-alerts-btn" onClick={() => { setShowAll(false); onClear?.() }} title="Clear current alerts and wait for new live alerts">
             <RefreshCw size={11} /> Refresh
           </button>
-          <button className="view-all-btn" onClick={() => {
-            if (!showAll) onRefresh?.()
-            setShowAll(!showAll)
-          }}>
+          <button className="view-all-btn" onClick={() => setShowAll(!showAll)}>
             {showAll ? 'Show Less' : 'View All'} <ChevronRight size={12} />
           </button>
         </div>
@@ -29,7 +26,7 @@ export default function LiveAlerts({ alerts = [], onRefresh, onAction }) {
         {alerts.length === 0 && (
           <div className="alerts-empty">
             <AlertTriangle size={16} />
-            <span>No live safety alerts. Alerts appear here when the camera raises one.</span>
+            <span>No alerts in the current feed. New alerts will appear here as they are detected.</span>
           </div>
         )}
         {visibleAlerts.map((alert, i) => (

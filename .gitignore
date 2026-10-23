@@ -173,6 +173,8 @@ cython_debug/
 .streamlit
 process.pid
 debug_output/
+/runs/
+/.ultralytics-config/
 
 # PRAHARI incident evidence is generated per deployment
 /output/incidents/

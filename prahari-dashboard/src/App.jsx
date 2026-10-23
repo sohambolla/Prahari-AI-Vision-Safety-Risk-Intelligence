@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react'
 import './index.css'
 import Header from './components/Header'
 import LiveVisionPanel from './components/LiveVisionPanel'
@@ -11,12 +11,37 @@ import ResourceMonitoring from './components/ResourceMonitoring'
 import SystemArchitecture from './components/SystemArchitecture'
 import MVPTimeline from './components/MVPTimeline'
 import MachineRegistry from './components/MachineRegistry'
+import DashboardUIExamples from './components/DashboardUIExamples'
 
-function App() {
+function DashboardApp() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [safetyAlerts, setSafetyAlerts] = useState([])
+  const [liveScannerHeight, setLiveScannerHeight] = useState(420)
+  const liveVisionSlotRef = useRef(null)
+  const alertsClearedAtRef = useRef(0)
+  const alertsHistoryGenerationRef = useRef(0)
   const apiBase = (import.meta.env.VITE_VISION_API_URL ||
     `${window.location.protocol}//${window.location.hostname || 'localhost'}:8000`).replace(/\/$/, '')
+
+  useLayoutEffect(() => {
+    const scanner = liveVisionSlotRef.current?.querySelector('.live-vision-card')
+    if (!scanner) return undefined
+
+    const syncAlertHeight = () => {
+      const height = Math.round(scanner.getBoundingClientRect().height)
+      if (height > 0) setLiveScannerHeight(height)
+    }
+
+    syncAlertHeight()
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', syncAlertHeight)
+      return () => window.removeEventListener('resize', syncAlertHeight)
+    }
+
+    const observer = new ResizeObserver(syncAlertHeight)
+    observer.observe(scanner)
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)
@@ -31,7 +56,9 @@ function App() {
 
   const handleSafetyAlert = useCallback((event) => {
     const timestamp = Number(event.timestamp)
-    const eventTime = Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp * 1000) : new Date()
+    const eventTimestamp = Number.isFinite(timestamp) && timestamp > 0 ? timestamp * 1000 : Date.now()
+    if (eventTimestamp <= alertsClearedAtRef.current) return
+    const eventTime = new Date(eventTimestamp)
     const eventId = event.event_id || event.id || `${event.camera_id || event.cameraId}-${event.event_type || event.type}-${eventTime.getTime()}`
     const cameraId = event.camera_id || event.cameraId || ''
     const location = event.location || [cameraId, event.zone_id].filter(Boolean).join(' · ') || 'Site location unavailable'
@@ -56,9 +83,14 @@ function App() {
     let socket
     let retryDelay = 1000
 
-    fetch(`${apiBase}/api/safety/events?limit=20`)
+    const historyGeneration = alertsHistoryGenerationRef.current
+    fetch(`${apiBase}/api/safety/events?limit=200`)
       .then(response => response.ok ? response.json() : Promise.reject(new Error('Incident history unavailable')))
-      .then(payload => { if (!disposed) (payload.events || []).slice().reverse().forEach(handleSafetyAlert) })
+      .then(payload => {
+        if (!disposed && historyGeneration === alertsHistoryGenerationRef.current) {
+          (payload.events || []).slice().reverse().forEach(handleSafetyAlert)
+        }
+      })
       .catch(() => {})
 
     const connect = () => {
@@ -103,15 +135,11 @@ function App() {
     return () => window.removeEventListener('prahari:safety-alert', onVisionAlert)
   }, [handleSafetyAlert])
 
-  const refreshSafetyAlerts = useCallback(async () => {
-    try {
-      const response = await fetch(`${apiBase}/api/safety/events?limit=200`)
-      if (!response.ok) return
-      const payload = await response.json()
-      setSafetyAlerts([])
-      ;(payload.events || []).slice().reverse().forEach(handleSafetyAlert)
-    } catch {}
-  }, [apiBase, handleSafetyAlert])
+  const clearSafetyAlerts = useCallback(() => {
+    alertsClearedAtRef.current = Date.now()
+    alertsHistoryGenerationRef.current += 1
+    setSafetyAlerts([])
+  }, [])
 
   const handleAlertAction = useCallback(async (alert, action) => {
     if (!alert.event_id) return
@@ -127,13 +155,13 @@ function App() {
 
       {/* Row 1: Live Vision + Alerts + Replay */}
       <div className="dashboard-grid">
-        <div className="col-5" style={{ animationDelay: '0.1s' }}>
+        <div className="col-5" ref={liveVisionSlotRef} style={{ animationDelay: '0.1s' }}>
           <LiveVisionPanel
             time={formatTime(currentTime)}
           />
         </div>
-        <div className="col-3" style={{ animationDelay: '0.2s' }}>
-          <LiveAlerts alerts={safetyAlerts} onRefresh={refreshSafetyAlerts} onAction={handleAlertAction} />
+        <div className="col-3 live-alerts-slot" style={{ animationDelay: '0.2s', '--live-scanner-height': `${liveScannerHeight}px` }}>
+          <LiveAlerts alerts={safetyAlerts} onClear={clearSafetyAlerts} onAction={handleAlertAction} />
         </div>
         <div className="col-4" style={{ animationDelay: '0.3s' }}>
           <EventReplay />
@@ -173,6 +201,11 @@ function App() {
       </div>
     </>
   )
+}
+
+function App() {
+  const path = window.location.pathname.replace(/\/+$/, '')
+  return path === '/ui-examples' ? <DashboardUIExamples /> : <DashboardApp />
 }
 
 export default App

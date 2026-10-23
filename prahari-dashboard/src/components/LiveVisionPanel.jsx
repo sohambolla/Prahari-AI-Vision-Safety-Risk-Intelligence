@@ -12,7 +12,7 @@ const CAM_FEEDS = [
   { id: 'cam-01', name: 'CAM 01: Construction Site CCTV', location: 'Excavation Area', src: '/videos/video_2.mp4', defaultDist: 0.8 },
   { id: 'cam-02', name: 'CAM 02: Foundry Workshop CCTV', location: 'Metal Casting Floor', src: '/videos/video_1.mp4', defaultDist: 2.1 },
   { id: 'cam-03', name: 'CAM 03: Production Floor CCTV', location: 'Industrial Workshop', src: '/videos/video_3.mp4', defaultDist: 1.2 },
-  { id: 'cam-04', name: 'CAM 04: Workshop Machine CCTV', location: 'Machine Area', src: '/videos/video_4.mp4', defaultDist: 3.4 },
+  { id: 'cam-04', name: 'CAM 04: Construction Site PPE CCTV', location: 'Construction Worksite', src: '/videos/cam-04-construction-ppe-4k.mp4', defaultDist: 3.4 },
   {
     id: 'cam-05', name: 'CAM 05: Restricted Walkway CCTV', location: 'Factory Pedestrian Aisle',
     src: '/videos/cctv-0_te1.mp4', defaultDist: 1.8,
@@ -47,11 +47,14 @@ const CAM_FEEDS = [
 const isPersonDetection = (detection) =>
   detection.is_person || /^person$/i.test(detection.class || '')
 
+const getPersonRiskLevel = (detection) => {
+  if (detection.ppe?.helmet?.detected !== true) return 'critical'
+  if (detection.ppe?.vest?.detected !== true) return 'warning'
+  return 'safe'
+}
+
 const isCriticalRiskDetection = (detection) =>
-  detection.risk_level === 'critical' || (
-    isPersonDetection(detection) &&
-    [detection.ppe?.helmet?.detected, detection.ppe?.vest?.detected].includes(false)
-  )
+  isPersonDetection(detection) && getPersonRiskLevel(detection) === 'critical'
 
 const EQUIPMENT_COLORS = {
   cup: '#ff9f1c',
@@ -91,9 +94,11 @@ const getEquipmentColor = (className = '') => {
 
 const getDetectionColor = (detection) => {
   if (isPersonDetection(detection)) {
-    return detection.color || (detection.risk_level === 'critical'
-      ? '#ff1744'
-      : detection.risk_level === 'warning' ? '#ffea00' : '#00e676')
+    return {
+      critical: '#ef4444',
+      warning: '#facc15',
+      safe: '#22c55e',
+    }[getPersonRiskLevel(detection)]
   }
   return getEquipmentColor(detection.class)
 }
@@ -104,15 +109,15 @@ export default function LiveVisionPanel({ time }) {
   const [showOverlays, setShowOverlays] = useState(true)
   const [showPPE, setShowPPE] = useState(true)
   const [showZones, setShowZones] = useState(true)
-  const [showVectors, setShowVectors] = useState(true)
+  const [showVectors, setShowVectors] = useState(false)
   const [filterMode, setFilterMode] = useState('all') // all, critical, ppe, ovs
   const [isAlertActive, setIsAlertActive] = useState(true)
   const [isScanning, setIsScanning] = useState(false)
   const [fps, setFps] = useState(null)
   const [inferenceMs, setInferenceMs] = useState(null)
   const [modelName, setModelName] = useState('YOLO11n')
-  const [promptText, setPromptText] = useState('forklift truck')
-  const [targetPrompts, setTargetPrompts] = useState(['forklift truck'])
+  const [promptText, setPromptText] = useState('')
+  const [targetPrompts, setTargetPrompts] = useState([])
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.15)
   const [openVocabularyActive, setOpenVocabularyActive] = useState(null)
   const [openVocabularyError, setOpenVocabularyError] = useState('')
@@ -237,10 +242,9 @@ export default function LiveVisionPanel({ time }) {
               const now = performance.now()
               const previous = detectionMemoryRef.current
               const next = new Map()
-              const freshIds = new Set()
 
-              data.detections.forEach(detection => {
-                const id = detection.track_id
+              data.detections.forEach((detection, index) => {
+                const id = detection.track_id || `${detection.class || 'detection'}-${index}`
                 const last = previous.get(id)
                 const pointX = detection.foot_x ?? (detection.x + detection.w / 2)
                 const pointY = detection.foot_y ?? (detection.y + detection.h)
@@ -261,12 +265,8 @@ export default function LiveVisionPanel({ time }) {
                 } : detection
 
                 next.set(id, { detection: { ...smoothed, trail: points }, lastSeen: now })
-                freshIds.add(id)
               })
 
-              previous.forEach((record, id) => {
-                if (!freshIds.has(id) && now - record.lastSeen < 750) next.set(id, record)
-              })
               trajectoryMemoryRef.current.forEach((record, id) => {
                 if (now - record.lastSeen > 2500) trajectoryMemoryRef.current.delete(id)
               })
@@ -312,7 +312,7 @@ export default function LiveVisionPanel({ time }) {
 
   // =============================================
   // Stream live frames to YOLO server
-  // Send a bounded frame rate so segmentation cannot build an inference backlog.
+  // Send a bounded frame rate so inference cannot build an unbounded backlog.
   // =============================================
   useEffect(() => {
     if (!isWsConnected || !isPlaying) return
@@ -435,8 +435,8 @@ export default function LiveVisionPanel({ time }) {
             <span className="telemetry-label">INFERENCE:</span>
             <span className="telemetry-val">{inferenceMs == null ? '--' : `${inferenceMs}ms`}</span>
             <span className="telemetry-sep">|</span>
-            <span className="telemetry-label">DETS:</span>
-            <span className="telemetry-val">{visibleDetections.length}</span>
+            <span className="telemetry-label">PEOPLE:</span>
+            <span className="telemetry-val">{currentDetections.filter(isPersonDetection).length}</span>
           </div>
 
           <button
@@ -448,14 +448,14 @@ export default function LiveVisionPanel({ time }) {
           </button>
           <button
             className={`icon-btn ${showPPE ? 'active' : ''}`}
-            title="Toggle PPE Kit Bounding Boxes (Helmet, Vest, Harness)"
+            title="Toggle PPE status labels"
             onClick={() => setShowPPE(!showPPE)}
           >
             <Crosshair size={14} />
           </button>
           <button
             className={`icon-btn ${showOverlays ? 'active' : ''}`}
-            title="Toggle Body Bounding Boxes"
+            title="Toggle detection boxes and labels"
             onClick={() => setShowOverlays(!showOverlays)}
           >
             <Eye size={14} />
@@ -476,7 +476,7 @@ export default function LiveVisionPanel({ time }) {
       <form className="open-vocabulary-controls" onSubmit={applyOpenVocabularyPrompts}>
         <div className="open-vocabulary-copy">
           <strong>Open-vocabulary equipment tracking</strong>
-          <span>Comma-separated labels; tracked entries into this camera’s red zone trigger an alert.</span>
+          <span>Optional equipment scan. Person PPE and restricted-area monitoring stay active by default.</span>
         </div>
         <input
           aria-label="Equipment and object prompts"
@@ -500,13 +500,15 @@ export default function LiveVisionPanel({ time }) {
         <button className="open-vocabulary-apply" type="submit">Apply targets</button>
         <span
           className={`open-vocabulary-status ${openVocabularyActive ? 'ready' : openVocabularyActive === false && openVocabularyError ? 'unavailable' : ''}`}
-          title={openVocabularyError || (openVocabularyActive ? 'Text-prompted segmentation is active.' : 'Waiting for the first inference frame.')}
+          title={openVocabularyError || (openVocabularyActive ? 'Text-prompted object detection is active.' : 'Waiting for the first inference frame.')}
         >
           {openVocabularyActive
-            ? 'MASKS + TRACKING'
+            ? 'OBJECTS + TRACKING'
             : openVocabularyActive === false
-              ? openVocabularyError ? 'OVS UNAVAILABLE' : targetPrompts.length ? 'OVS INACTIVE' : 'YOLO DETECTION'
-              : 'OVS STARTING'}
+              ? targetPrompts.length
+                ? openVocabularyError ? 'OVS UNAVAILABLE' : 'OVS INACTIVE'
+                : 'PERSON + PPE'
+              : targetPrompts.length ? 'OVS STARTING' : 'PPE SCAN STARTING'}
         </span>
       </form>
 
@@ -570,26 +572,6 @@ export default function LiveVisionPanel({ time }) {
           </svg>
         )}
 
-        {showOverlays && (
-          <svg className="segmentation-mask-layer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-            {visibleDetections.filter(detection => detection.mask_polygon?.length >= 3).map(detection => {
-              const points = detection.mask_polygon.map(([x, y]) => `${x},${y}`).join(' ')
-              const color = getDetectionColor(detection)
-              return (
-                <polygon
-                  key={`mask-${detection.track_id}`}
-                  points={points}
-                  fill={color}
-                  fillOpacity="0.25"
-                  stroke={color}
-                  strokeWidth="0.28"
-                  vectorEffect="non-scaling-stroke"
-                />
-              )
-            })}
-          </svg>
-        )}
-
         {showOverlays && visibleDetections.some(detection => detection.open_vocabulary && detection.trail?.length > 1) && (
           <svg className="object-trail-layer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {visibleDetections.filter(detection => detection.open_vocabulary && detection.trail?.length > 1).map(detection => (
@@ -609,10 +591,10 @@ export default function LiveVisionPanel({ time }) {
         {/* Dynamic Laser Proximity Vectors (Videos only) */}
         {showVectors && showZones && activeHazardZone && selectedCam.id !== 'cam-webcam' && (
           <svg className="proximity-vectors-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-            {visibleDetections.map((det) => {
+            {visibleDetections.filter(det => isPersonDetection(det) && det.foot_x != null).map((det) => {
               const hzCenter = activeHazardZone[0] || [35, 60]
               const isCrit = isCriticalRiskDetection(det)
-              const color = isCrit ? '#ef4444' : det.risk_level === 'warning' ? '#f59e0b' : '#10b981'
+              const color = getDetectionColor(det)
               return (
                 <g key={`vec-${det.track_id}`}>
                   <line
@@ -633,147 +615,81 @@ export default function LiveVisionPanel({ time }) {
           </svg>
         )}
 
-        {/* ========================================================
-            UNIFIED REAL-TIME DETECTION RENDERER
-            Works for ALL modes: webcam, video files, WS live stream
-            Step 1: Renders ALL detected objects (person, chair, car, etc.)
-            Step 2: For persons only, adds PPE sub-boxes (helmet, vest)
-            ======================================================== */}
-        {showOverlays && (selectedCam.id !== 'cam-webcam' || (webcamActive && isWsConnected)) && visibleDetections.map((det) => {
-          const isPerson = det.is_person || det.class === 'Person' || det.class === 'person'
-          const isCritical = isCriticalRiskDetection(det)
-          const isWarning = det.risk_level === 'warning'
-          const helmet = det.ppe?.helmet
-          const vest = det.ppe?.vest
-          const harness = det.ppe?.harness
+        {showOverlays && (selectedCam.id !== 'cam-webcam' || (webcamActive && isWsConnected)) && visibleDetections.map((det, index) => {
+          const isPerson = isPersonDetection(det)
+          const key = det.track_id || `${det.class || 'detection'}-${index}`
 
-          // Color: vibrant high-visibility colors
-          const boxColor = isPerson
-            ? (isCritical ? '#ff1744' : isWarning ? '#ffea00' : '#00e676')
-            : getDetectionColor(det)
+          if (isPerson) {
+            const status = (kind) => det.ppe?.[kind]?.detected === true
+              ? { symbol: '✓', className: 'ppe-status-ok' }
+              : { symbol: '×', className: 'ppe-status-missing' }
+            const helmet = status('helmet')
+            const vest = status('vest')
+            const riskLevel = getPersonRiskLevel(det)
+            const personColor = getDetectionColor(det)
+            const riskTag = riskLevel === 'critical' ? 'critical' : riskLevel === 'warning' ? 'warning' : 'safe'
+            const ppeSummary = riskLevel === 'critical'
+              ? 'HARDHAT MISSING'
+              : riskLevel === 'warning'
+                ? 'VEST MISSING'
+                : 'PPE OK'
 
-          // CSS class for risk-based styling (person) or generic object
-          const riskClass = isPerson
-            ? (det.risk_level || 'safe')
-            : 'object'
-
-          return (
-            <div key={det.track_id}>
-              {/* Main Bounding Box for ANY detected object */}
+            return (
               <div
-                className={`ai-bbox bbox-${riskClass}`}
+                key={key}
+                className={`ai-bbox bbox-${riskLevel}`}
                 style={{
-                  '--bbox-color': boxColor,
+                  '--bbox-color': personColor,
                   left: `${det.x}%`,
                   top: `${det.y}%`,
                   width: `${det.w}%`,
                   height: `${det.h}%`,
-                  borderColor: boxColor,
                 }}
               >
-                <div className="corner top-left" style={{ borderColor: boxColor }} />
-                <div className="corner top-right" style={{ borderColor: boxColor }} />
-                <div className="corner bottom-left" style={{ borderColor: boxColor }} />
-                <div className="corner bottom-right" style={{ borderColor: boxColor }} />
-
-                {/* Object Class Tag */}
-                <div
-                  className="bbox-tag"
-                  style={{ background: boxColor, color: (isWarning ? '#000' : '#fff') }}
-                >
-                  <span className="bbox-id">{det.track_id}</span>
-                  <span className="bbox-type">
-                    {det.class} [{det.confidence}%]
-                  </span>
-                  {isPerson && isCritical && (
-                    <span className="bbox-alert-pill">NO PPE ⚠️</span>
-                  )}
-                  {isPerson && !isCritical && !isWarning && (
-                    <span className="bbox-alert-pill" style={{ color: '#00e676' }}>COMPLIANT ✓</span>
-                  )}
-                </div>
-
-                {/* Meta info: Person gets safety telemetry, objects get simple label */}
-                <div className="bbox-meta">
-                  {isPerson ? (
-                    <>
-                      <div className="bbox-meta-row">
-                        <span className="meta-k">HELMET:</span>
-                        <span className={`meta-v ${helmet?.detected ? 'text-success' : 'text-critical'}`}>
-                          {helmet?.detected ? `YES [${helmet.confidence}%]` : 'NOT DETECTED ⚠️'}
-                        </span>
-                      </div>
-                      <div className="bbox-meta-row">
-                        <span className="meta-k">VEST:</span>
-                        <span className={`meta-v ${vest?.detected ? 'text-success' : 'text-critical'}`}>
-                          {vest?.detected ? `YES [${vest.confidence}%]` : 'NOT DETECTED ⚠️'}
-                        </span>
-                      </div>
-                      {det.dwell_time != null && (
-                        <div className="bbox-meta-row">
-                          <span className="meta-k">DWELL:</span>
-                          <span className="meta-v">{det.dwell_time}s</span>
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="bbox-meta-row">
-                      <span className="meta-k">TYPE:</span>
-                      <span className="meta-v">{det.class}</span>
-                    </div>
+                <div className="corner top-left" style={{ borderColor: personColor }} />
+                <div className="corner top-right" style={{ borderColor: personColor }} />
+                <div className="corner bottom-left" style={{ borderColor: personColor }} />
+                <div className="corner bottom-right" style={{ borderColor: personColor }} />
+                <div className={`bbox-tag tag-${riskTag}`} style={{ background: personColor }}>
+                  <span className="bbox-id">{det.track_id || 'PERSON'}</span>
+                  <span className="bbox-type">PERSON · {ppeSummary} · {det.confidence}%</span>
+                  {showPPE && (
+                    <span className="person-ppe-status">
+                      <span title="Hardhat status" className={helmet.className}>H {helmet.symbol}</span>
+                      <span title="Safety vest status" className={vest.className}>V {vest.symbol}</span>
+                    </span>
                   )}
                 </div>
               </div>
+            )
+          }
 
-              {/* PPE Sub-Boxes: ONLY rendered for Person detections */}
-              {isPerson && showPPE && helmet?.box && (
-                <div
-                  className={`ppe-sub-box ppe-helmet ${helmet.detected ? 'ppe-ok' : 'ppe-missing pulse-glow-red'}`}
-                  style={{
-                    left: `${helmet.box.x}%`,
-                    top: `${helmet.box.y}%`,
-                    width: `${helmet.box.w}%`,
-                    height: `${helmet.box.h}%`
-                  }}
-                >
-                  <span className="ppe-tag font-mono">
-                    {helmet.detected ? `Hardhat ✓ [${helmet.confidence}%]` : `NO HARDHAT ⚠️`}
-                  </span>
+          const color = getDetectionColor(det)
+          return (
+            <div key={key}>
+              <div
+                className="ai-bbox bbox-object"
+                style={{
+                  '--bbox-color': color,
+                  left: `${det.x}%`,
+                  top: `${det.y}%`,
+                  width: `${det.w}%`,
+                  height: `${det.h}%`,
+                  borderColor: color,
+                }}
+              >
+                <div className="corner top-left" style={{ borderColor: color }} />
+                <div className="corner top-right" style={{ borderColor: color }} />
+                <div className="corner bottom-left" style={{ borderColor: color }} />
+                <div className="corner bottom-right" style={{ borderColor: color }} />
+                <div className="bbox-tag" style={{ background: color }}>
+                  <span className="bbox-id">{det.track_id || 'OBJ'}</span>
+                  <span className="bbox-type">{det.class} [{det.confidence}%]</span>
                 </div>
-              )}
-
-              {isPerson && showPPE && vest?.box && (
-                <div
-                  className={`ppe-sub-box ppe-vest ${vest.detected ? 'ppe-ok' : 'ppe-missing'}`}
-                  style={{
-                    left: `${vest.box.x}%`,
-                    top: `${vest.box.y}%`,
-                    width: `${vest.box.w}%`,
-                    height: `${vest.box.h}%`
-                  }}
-                >
-                  <span className="ppe-tag font-mono">
-                    {vest.detected ? `Safety Vest ✓ [${vest.confidence}%]` : `NO VEST ⚠️`}
-                  </span>
-                </div>
-              )}
-
-              {/* Distance badge: only for persons with foot position */}
-              {isPerson && det.foot_x != null && det.dist_m != null && (
-                <div
-                  className="live-distance-badge font-mono"
-                  style={{
-                    left: `${det.foot_x}%`,
-                    top: `${Math.min(92, (det.foot_y || det.y + det.h) + 1)}%`
-                  }}
-                >
-                  <span>DIST: {det.dist_m}m</span>
-                </div>
-              )}
+              </div>
             </div>
           )
         })}
-
         {/* Hazard Zone Label */}
         {showZones && activeHazardZone && selectedCam.id !== 'cam-webcam' && (
           <div
